@@ -32,7 +32,8 @@ gtk_dep = dependency('gtk+-2.0', version: '>= 2.24.0')
 hexchat_gtk_deps = [
   hexchat_common_dep,
   libgmodule_dep, # used by libsexy
-  gtk_dep
+  gtk_dep,
+  libcanberra_dep,
 ]
 
 if gtk_dep.get_pkgconfig_variable('target') == 'x11'
