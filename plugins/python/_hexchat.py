@@ -78,9 +78,8 @@ def emit_print(event_name, *args, **kwargs):
     return ret
 
 
-# TODO: this shadows itself. command should be changed to cmd
-def command(command):
-    lib.hexchat_command(lib.ph, command.encode())
+def command(cmd):
+    lib.hexchat_command(lib.ph, cmd.encode())
 
 
 def nickcmp(string1, string2):
@@ -220,11 +219,10 @@ def get_list(name):
     return ret
 
 
-# TODO: 'command' here shadows command above, and should be renamed to cmd
-def hook_command(command, callback, userdata=None, priority=PRI_NORM, help=None):
+def hook_command(cmd, callback, userdata=None, priority=PRI_NORM, help=None):
     plugin = __get_current_plugin()
     hook = plugin.add_hook(callback, userdata)
-    handle = lib.hexchat_hook_command(lib.ph, command.encode(), priority, lib._on_command_hook,
+    handle = lib.hexchat_hook_command(lib.ph, cmd.encode(), priority, lib._on_command_hook,
                                       help.encode() if help is not None else ffi.NULL, hook.handle)
 
     hook.hexchat_hook = handle
