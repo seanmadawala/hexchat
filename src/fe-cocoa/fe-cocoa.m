@@ -582,6 +582,34 @@ fe_init (void)
 	prefs.hex_gui_autoopen_dialog = 0; /* no auto-open dialog             */
 	prefs.hex_gui_lagometer = 0;       /* no lag meter widget yet         */
 	prefs.hex_gui_slist_skip = 1;      /* skip the server list on startup */
+
+	/*
+	 * IMPORTANT: Bootstrap NSApplication and our delegates here in fe_init(),
+	 * not in fe_main(). Why? Because the backend creates sessions (and calls
+	 * fe_new_window) BETWEEN fe_init() and fe_main(). If we wait until
+	 * fe_main() to create the input delegate, it will be NULL when
+	 * fe_new_window() tries to use it — and the input field won't work!
+	 *
+	 * LESSON: Always think about initialization order:
+	 *   1. fe_args()         — parse command line
+	 *   2. fe_init()         — set up the UI toolkit  <-- WE ARE HERE
+	 *   3. backend init      — loads config, creates sessions
+	 *   4. fe_new_window()   — called for each session (needs delegates!)
+	 *   5. fe_main()         — start the event loop
+	 */
+	@autoreleasepool
+	{
+		[NSApplication sharedApplication];
+
+		appDelegate = [[HCAppDelegate alloc] init];
+		[NSApp setDelegate:appDelegate];
+
+		inputDel = [[HCInputDelegate alloc] init];
+
+		create_menu_bar ();
+
+		[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+	}
 }
 
 
@@ -616,18 +644,11 @@ fe_main (void)
 	@autoreleasepool
 	{
 		/*
-		 * [NSApplication sharedApplication] creates the singleton NSApp.
-		 * Every macOS app has exactly ONE NSApplication instance.
-		 * This call also sets the global NSApp variable.
+		 * NSApplication, delegates, and the menu bar were already set up
+		 * in fe_init(). Here we just need to:
+		 *   1. Start the GLib pump timer
+		 *   2. Enter the Cocoa event loop
 		 */
-		[NSApplication sharedApplication];
-
-		/* Create our app delegate and assign it to NSApp. */
-		appDelegate = [[HCAppDelegate alloc] init];
-		[NSApp setDelegate:appDelegate];
-
-		/* Create the menu bar (Cmd+Q needs this to work). */
-		create_menu_bar ();
 
 		/*
 		 * Create the NSTimer that pumps GLib events.
@@ -648,10 +669,11 @@ fe_main (void)
 			repeats:YES];
 
 		/*
-		 * Also create the shared input delegate for text fields.
-		 * We create it once and reuse it for all input fields.
+		 * Activate the app — bring it to the front of all other apps.
+		 * We do this here (not in fe_init) because the windows are now
+		 * created and ready to be shown.
 		 */
-		inputDel = [[HCInputDelegate alloc] init];
+		[NSApp activateIgnoringOtherApps:YES];
 
 		/*
 		 * [NSApp run] — start the Cocoa event loop.
