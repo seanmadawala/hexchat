@@ -157,6 +157,13 @@ foreach ldflag : test_ldflags
 endforeach
 add_project_link_arguments(global_ldflags, language: 'c')
 
+# If building the Cocoa frontend, we need the Objective-C compiler.
+# add_languages() tells Meson "we also compile .m files in this project".
+# On macOS, clang handles both C and Objective-C natively.
+if get_option('cocoa-frontend')
+  add_languages('objc')
+endif
+
 subdir('src')
 if get_option('plugin')
   subdir('plugins')

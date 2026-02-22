@@ -5,6 +5,9 @@ option('gtk-frontend', type: 'boolean',
 option('text-frontend', type: 'boolean', value: false,
   description: 'Text interface (not generally useful)'
 )
+option('cocoa-frontend', type: 'boolean', value: false,
+  description: 'Native macOS Cocoa interface (experimental)'
+)
 option('theme-manager', type: 'boolean', value: false,
   description: 'Utility to help manage themes, requires mono/.net'
 )
