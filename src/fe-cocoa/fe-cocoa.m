@@ -1,103 +1,45 @@
-/* HexChat — Cocoa Frontend
+/* HexChat — Cocoa Frontend (Phase 2)
  * Copyright (C) 2026 Sean Madawala.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
 /*
  * ==========================================================================
- *  OBJECTIVE-C CRASH COURSE FOR C PROGRAMMERS
- * ==========================================================================
+ *  PHASE 2: Single window with server/channel tree + user list
  *
- *  Objective-C is C with objects bolted on. Everything you know about C
- *  still works — pointers, malloc, structs, #include, etc.
+ *  New Cocoa concepts introduced in this phase:
  *
- *  The new stuff:
+ *  NSOutlineView — A hierarchical (tree) table view. Like NSTableView
+ *    but rows can have children (expandable with disclosure triangles).
+ *    Perfect for: server → channel1, channel2, ...
  *
- *  1. IMPORTING (instead of #include):
- *       #import <AppKit/AppKit.h>
- *     Like #include but automatically prevents double-inclusion (no need
- *     for #ifndef guards). AppKit.h pulls in ALL of macOS's UI classes.
+ *  NSSplitView — A view that divides space into resizable panes.
+ *    Like having movable dividers between panels. The user can drag
+ *    the dividers to resize the tree, chat, and user list columns.
  *
- *  2. SENDING MESSAGES (instead of calling functions):
- *       C:     strlen(myString)
- *       ObjC:  [myString length]
+ *  NSTextStorage — The "model" (data) behind an NSTextView. Think of
+ *    it as a mutable attributed string that can be swapped in and out.
+ *    Each session has its own NSTextStorage. When you click a channel
+ *    in the tree, we tell the layout manager to use that session's
+ *    text storage, and the text view instantly shows different content.
  *
- *     The square brackets mean "send the message 'length' to myString".
- *     Think of it as calling a method on an object.
+ *  Data Source pattern — NSOutlineView and NSTableView don't store
+ *    data themselves. Instead, they ask a "data source" object:
+ *    "how many rows?" "what's in row 3?" This is like a callback
+ *    system but object-oriented. We implement data source protocols.
  *
- *  3. CREATING OBJECTS:
- *       NSWindow *win = [[NSWindow alloc] initWithContentRect:...];
- *
- *     [[ClassName alloc] initWith...] is like malloc + constructor.
- *     "alloc" allocates memory, "init..." initializes it.
- *
- *  4. STRINGS:
- *       @"Hello"    — an NSString (Objective-C string object)
- *       "Hello"     — a plain C string (char *)
- *
- *     To convert: [NSString stringWithUTF8String: myCString]
- *
- *  5. CLASSES:
- *       @interface MyClass : NSObject   — declare a class (like a struct + methods)
- *       @end
- *
- *       @implementation MyClass         — define the methods
- *       - (void)doSomething { ... }     — instance method (dash = instance)
- *       + (void)doSomething { ... }     — class method (plus = static/class)
- *       @end
- *
- *  6. PROPERTIES:
- *       @property (strong) NSString *name;
- *     Automatically creates a getter and setter. Access with dot syntax:
- *       self.name = @"HexChat";
- *
- *  7. PROTOCOLS (like interfaces in other languages):
- *       @interface MyClass : NSObject <NSTextFieldDelegate>
- *     Means "MyClass promises to implement the NSTextFieldDelegate methods".
- *
- *  8. MEMORY:
- *     We use ARC (Automatic Reference Counting) — the compiler inserts
- *     retain/release for us. But when storing ObjC objects in C structs
- *     (like session_gui), we use __bridge casts to cross the C/ObjC boundary:
- *
- *       void *cptr = (__bridge_retained void *)objcObject;  // C now "owns" it
- *       NSWindow *w = (__bridge_transfer NSWindow *)cptr;   // ObjC takes it back
- *
- *     For simplicity in this skeleton, we use CFBridgingRetain/CFBridgingRelease.
- *
- *  9. nil vs NULL:
- *       nil  = a null Objective-C object pointer (like NULL but for objects)
- *       NULL = a null C pointer (same as always)
- *     Sending a message to nil is safe — it just returns 0/nil/NO.
- *     This is DIFFERENT from C where dereferencing NULL crashes!
- *
- *  That's it! The rest is just learning which classes to use:
- *    NSWindow     = a window on screen
- *    NSTextView   = multi-line editable text area (like a rich textarea)
- *    NSScrollView = makes any view scrollable
- *    NSTextField   = single-line text input OR a label
- *    NSTableView  = a table/list (for the user list)
- *    NSApplication = THE app — manages event loop, menus, dock icon
- *    NSTimer      = calls your function after a delay (like setTimeout)
+ *  Delegate pattern — Objects that handle events on behalf of others.
+ *    NSOutlineViewDelegate handles "user clicked a row".
+ *    NSTextFieldDelegate handles "user pressed Enter".
  * ==========================================================================
  */
 
-#import <Cocoa/Cocoa.h>   /* Imports ALL of AppKit + Foundation. */
+#import <Cocoa/Cocoa.h>
 
-/* Pull in the Meson-generated config (HAS_OPENSSL, PACKAGE_VERSION, etc.) */
 #include "config.h"
 
 #include <stdio.h>
@@ -106,14 +48,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 
-/* GLib — we still use this for the event loop (timers, socket I/O).
- * HexChat's backend relies heavily on GLib types (gboolean, gchar, etc.)
- * and on GLib's socket monitoring. Replacing GLib entirely would mean
- * rewriting a lot of backend code. So we keep it and integrate it
- * with Cocoa's run loop. */
 #include <glib.h>
 
-/* HexChat backend headers */
 #include "../common/hexchat.h"
 #include "../common/hexchatc.h"
 #include "../common/cfgfiles.h"
@@ -121,374 +57,804 @@
 #include "../common/util.h"
 #include "../common/fe.h"
 
-/* Our own header (the session_gui / server_gui structs) */
 #include "fe-cocoa.h"
 
 
 /* ==========================================================================
- *  OBJECTIVE-C LESSON: @interface / @implementation
- * ==========================================================================
+ *  FORWARD DECLARATIONS
  *
- *  Below we define a "delegate" class. In Cocoa, a delegate is an object
- *  that handles events on behalf of another object.
- *
- *  NSApplicationDelegate — handles app-level events (launch, quit, etc.)
- *  NSTextFieldDelegate   — handles text field events (user pressed Enter)
- *
- *  Think of it like registering callback functions, but object-oriented.
+ *  We declare classes and functions here so they can reference each other.
+ *  The full @implementation blocks come later in the file.
  * ==========================================================================
  */
 
-/*
- * HCAppDelegate — our main application delegate.
+static void create_main_window (void);
+static void create_menu_bar (void);
+static void switch_to_session (struct session *sess);
+static void refresh_channel_tree (void);
+static void refresh_user_list (void);
+
+/* Helper: get the NSTextStorage for a session. */
+static inline NSTextStorage *
+get_text_storage (struct session *sess)
+{
+	if (!sess || !sess->gui || !sess->gui->text_storage)
+		return nil;
+	return (__bridge NSTextStorage *)sess->gui->text_storage;
+}
+
+/* Helper: get the user list array for a session. */
+static inline NSMutableArray *
+get_user_list_data (struct session *sess)
+{
+	if (!sess || !sess->gui || !sess->gui->user_list_data)
+		return nil;
+	return (__bridge NSMutableArray *)sess->gui->user_list_data;
+}
+
+
+/* ==========================================================================
+ *  DATA MODEL — Wrapper objects for the channel tree
+ * ==========================================================================
  *
- * @interface declares what methods and properties the class has.
- * The part in angle brackets <NSApplicationDelegate> means
- * "this class implements the NSApplicationDelegate protocol".
+ *  NSOutlineView needs Objective-C objects as "items" in the tree.
+ *  We can't pass raw C pointers (struct server *, struct session *)
+ *  directly because NSOutlineView retains items and compares them
+ *  by object identity.
+ *
+ *  HCServerNode wraps a server — it's a top-level row in the tree.
+ *  HCSessionNode wraps a session — it's a child row under a server.
+ *
+ *  We maintain a global NSMutableArray of HCServerNode objects.
+ *  Each HCServerNode has an NSMutableArray of HCSessionNode children.
+ * ==========================================================================
  */
+
+@interface HCServerNode : NSObject
+@property (assign, nonatomic) struct server *server;    /* C pointer, not retained */
+@property (strong, nonatomic) NSString *name;           /* Display name */
+@property (strong, nonatomic) NSMutableArray *children;  /* HCSessionNode objects */
+@end
+
+@implementation HCServerNode
+- (instancetype)initWithServer:(struct server *)serv
+{
+	self = [super init];
+	if (self)
+	{
+		_server = serv;
+		_name = serv->servername[0]
+			? [NSString stringWithUTF8String:serv->servername]
+			: @"(connecting...)";
+		_children = [[NSMutableArray alloc] init];
+	}
+	return self;
+}
+@end
+
+@interface HCSessionNode : NSObject
+@property (assign, nonatomic) struct session *session;
+@property (strong, nonatomic) NSString *name;
+@end
+
+@implementation HCSessionNode
+- (instancetype)initWithSession:(struct session *)sess
+{
+	self = [super init];
+	if (self)
+	{
+		_session = sess;
+		_name = sess->channel[0]
+			? [NSString stringWithUTF8String:sess->channel]
+			: @"(server)";
+	}
+	return self;
+}
+@end
+
+
+/* ==========================================================================
+ *  GLOBAL STATE — The single main window and its subviews
+ * ==========================================================================
+ */
+
+static int done = FALSE;
+static int done_intro = 0;
+
+/* --- The one main window and its components --- */
+static NSWindow      *mainWindow;       /* The single app window               */
+static NSSplitView   *splitView;        /* 3-pane: tree | chat | users         */
+static NSOutlineView *channelTree;      /* Left: server/channel tree           */
+static NSScrollView  *channelTreeScroll;/* Wraps the outline view              */
+static NSTextView    *chatTextView;     /* Center: chat text display           */
+static NSScrollView  *chatScrollView;   /* Wraps the text view                 */
+static NSTableView   *userListTable;    /* Right: user nick list               */
+static NSScrollView  *userListScroll;   /* Wraps the table view                */
+static NSTextField   *inputField;       /* Bottom: text input                  */
+
+/* --- Data model for the channel tree --- */
+static NSMutableArray *serverNodes;     /* Array of HCServerNode               */
+
+/* --- Delegates (prevent deallocation) --- */
+static id appDelegate;
+static id inputDelegate;
+static id treeDataSource;              /* Also serves as delegate              */
+static id userListDataSource;          /* Also serves as delegate              */
+
+
+/* ==========================================================================
+ *  HCAppDelegate — Application lifecycle
+ * ==========================================================================
+ */
+
 @interface HCAppDelegate : NSObject <NSApplicationDelegate>
-
-/*
- * @property declares instance variables with automatic getters/setters.
- *
- * (strong) means "this object owns the timer and keeps it alive".
- *   In C terms: it's like the struct holding a reference that prevents
- *   the object from being freed.
- *
- * (nonatomic) means "not thread-safe" — fine for UI code which is
- *   always on the main thread.
- */
 @property (strong, nonatomic) NSTimer *glibTimer;
-
 @end
 
-/*
- * HCInputDelegate — handles events from the text input field.
- *
- * When the user presses Enter in the input box, Cocoa calls our
- * controlTextDidEndEditing: method. We then send the text to HexChat's
- * backend via handle_multiline().
- */
-@interface HCInputDelegate : NSObject <NSTextFieldDelegate>
-@end
-
-
-/* ==========================================================================
- *  GLOBAL STATE
- * ==========================================================================
- *
- *  These globals are similar to what fe-text.c uses.
- *  "static" means file-scope only (not visible to other .c/.m files).
- * ==========================================================================
- */
-
-static int done = FALSE;           /* Has the user quit?                     */
-static int done_intro = 0;         /* Have we shown the welcome message?     */
-static HCAppDelegate *appDelegate; /* Our app delegate (prevent dealloc)     */
-static HCInputDelegate *inputDel;  /* Our input field delegate               */
-
-
-/* ==========================================================================
- *  HELPER: Store and retrieve Cocoa objects from session_gui void* fields
- * ==========================================================================
- *
- *  OBJECTIVE-C LESSON: Bridging between C and Objective-C memory
- *
- *  When we store an NSWindow* in a void* field of a C struct, we need to
- *  tell the compiler "I'm taking ownership of this object in C land".
- *
- *  CFBridgingRetain(obj)  — increments the reference count, returns void*
- *                           (the object won't be freed while we hold it)
- *
- *  CFBridgingRelease(ptr) — decrements the reference count, returns id
- *                           (if count reaches 0, the object is freed)
- *
- *  (__bridge Type)ptr     — just casts, no ownership change
- *                           (use for temporary access, not storage)
- *
- *  Simple rule:
- *    Storing into void*  -> use CFBridgingRetain
- *    Reading from void*  -> use (__bridge Type)
- *    Freeing from void*  -> use CFBridgingRelease
- * ==========================================================================
- */
-
-/* Safely get the NSWindow from a session, or nil if not set up yet. */
-static inline NSWindow *
-get_window (struct session *sess)
-{
-	if (!sess || !sess->gui || !sess->gui->window)
-		return nil;
-	return (__bridge NSWindow *)sess->gui->window;
-}
-
-/* Safely get the NSTextView from a session. */
-static inline NSTextView *
-get_text_view (struct session *sess)
-{
-	if (!sess || !sess->gui || !sess->gui->text_view)
-		return nil;
-	return (__bridge NSTextView *)sess->gui->text_view;
-}
-
-/* Safely get the input NSTextField from a session. */
-static inline NSTextField *
-get_input_field (struct session *sess)
-{
-	if (!sess || !sess->gui || !sess->gui->input_field)
-		return nil;
-	return (__bridge NSTextField *)sess->gui->input_field;
-}
-
-
-/* ==========================================================================
- *  HCAppDelegate IMPLEMENTATION
- * ==========================================================================
- *
- *  OBJECTIVE-C LESSON: @implementation
- *
- *  This is where we write the actual code for HCAppDelegate's methods.
- *
- *  Methods that start with "-" are instance methods (called on an object).
- *  Methods that start with "+" are class methods (called on the class itself).
- *
- *  The method signature syntax is:
- *    - (ReturnType)methodName:(ParamType)param1 secondPart:(ParamType)param2
- *
- *  In C this would be:
- *    ReturnType methodName(ParamType param1, ParamType param2)
- *
- *  Why the weird syntax? Each "part" of the name describes the parameter:
- *    [window initWithContentRect:rect styleMask:style ...]
- *  reads like English: "init with content rect ___ style mask ___"
- * ==========================================================================
- */
 @implementation HCAppDelegate
 
-/*
- * applicationDidFinishLaunching: is called by macOS after NSApplication
- * has finished starting up. This is similar to GTK's "realize" signal.
- *
- * The (NSNotification *) parameter contains info about the event.
- * We don't need it here, so we ignore it.
- */
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
-	/*
-	 * Activate our app (bring it to the front).
-	 *
-	 * NSApplicationActivationPolicyRegular means "this app appears in the
-	 * Dock and has a menu bar" (as opposed to a background daemon).
-	 */
 	[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-
-	/*
-	 * OBJECTIVE-C LESSON: preprocessor check
-	 *
-	 * NSApp is a global variable that points to the shared NSApplication
-	 * instance. It's set up by [NSApplication sharedApplication].
-	 */
 	[NSApp activateIgnoringOtherApps:YES];
 }
 
-/*
- * applicationShouldTerminateAfterLastWindowClosed: — macOS asks us:
- * "should the app quit when the last window is closed?"
- * We say NO because HexChat can reconnect and reopen windows.
- */
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
 {
-	return NO;
+	return YES;  /* Quit when the window closes. */
 }
 
-/*
- * applicationShouldTerminate: — macOS asks us: "is it OK to quit?"
- * We call hexchat_exit() which does graceful cleanup (disconnect from
- * servers, save config, etc.) and then returns. We allow the quit.
- */
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
 {
 	hexchat_exit();
 	return NSTerminateNow;
 }
 
-/*
- * pumpGLib: — called periodically by our NSTimer.
- *
- * This is how we integrate GLib with Cocoa's event loop:
- *
- * - Cocoa has its OWN event loop (NSApplication's run loop)
- * - GLib has its OWN event loop (GMainLoop / GMainContext)
- * - HexChat's backend uses GLib for socket I/O and timers
- *
- * Solution: we let Cocoa's run loop be the "boss", and use an NSTimer
- * to periodically "pump" (check) GLib's pending events.
- *
- * g_main_context_iteration(NULL, FALSE) means:
- *   NULL  = use the default GLib context
- *   FALSE = don't block (return immediately if nothing to do)
- *
- * We call this ~100 times per second (every 10ms) so GLib events
- * get processed promptly without noticeable lag.
- */
 - (void)pumpGLib:(NSTimer *)timer
 {
-	/* Process all pending GLib events without blocking. */
-	while (g_main_context_iteration(NULL, FALSE))
-		;  /* empty body — just keep pumping until there's nothing left */
-
+	while (g_main_context_iteration (NULL, FALSE))
+		;
 	if (done)
-	{
 		[NSApp terminate:nil];
-	}
 }
 
-@end  /* HCAppDelegate */
+@end
 
 
 /* ==========================================================================
- *  HCInputDelegate IMPLEMENTATION — handles the input text field
+ *  HCInputDelegate — Handles Enter key in the input field
  * ==========================================================================
  */
+
+@interface HCInputDelegate : NSObject <NSTextFieldDelegate>
+@end
+
 @implementation HCInputDelegate
 
-/*
- * control:textView:doCommandBySelector: is called when the user presses
- * a special key (Enter, Tab, Escape, etc.) in an NSTextField.
- *
- * OBJECTIVE-C LESSON: @selector
- *   @selector(insertNewline:) is a way to refer to a method by name.
- *   It's like a function pointer, but for Objective-C methods.
- *   insertNewline: is the method that fires when the user hits Enter.
- *
- * We check: "did the user press Enter?" If yes, we grab the text and
- * send it to HexChat's command handler.
- *
- * Return YES means "we handled it, don't do the default action".
- * Return NO means "we didn't handle it, do the default action".
- */
 - (BOOL)control:(NSControl *)control
 	   textView:(NSTextView *)textView
 doCommandBySelector:(SEL)commandSelector
 {
 	if (commandSelector == @selector(insertNewline:))
 	{
-		/* Get the text from the input field as a C string. */
 		NSTextField *field = (NSTextField *)control;
 		const char *text = [[field stringValue] UTF8String];
 
 		if (text && text[0] != '\0' && current_sess)
 		{
-			/*
-			 * handle_multiline() is HexChat's backend function that
-			 * processes user input. It handles:
-			 *   - Regular messages (sent to the channel)
-			 *   - Commands starting with / (like /join, /quit, /msg)
-			 *   - Multi-line pastes
-			 *
-			 * Parameters:
-			 *   current_sess = the currently active chat session
-			 *   (char *)text = the text to process (cast away const)
-			 *   TRUE         = allow commands (process /slash commands)
-			 *   FALSE        = don't add to command history (we could change this)
-			 */
 			handle_multiline (current_sess, (char *)text, TRUE, FALSE);
-
-			/* Clear the input field after sending. */
 			[field setStringValue:@""];
 		}
-
-		return YES;  /* We handled the Enter key. */
+		return YES;
 	}
-
-	return NO;  /* Let Cocoa handle other keys normally. */
+	return NO;
 }
 
-@end  /* HCInputDelegate */
+@end
 
 
 /* ==========================================================================
- *  MENU BAR SETUP
+ *  HCChannelTreeDataSource — Data source + delegate for the left sidebar
  * ==========================================================================
  *
- *  Every macOS app needs a menu bar. Without one, you can't even Cmd+Q
- *  to quit! This function creates a minimal menu with:
- *    - Application menu (with Quit)
+ *  COCOA LESSON: NSOutlineViewDataSource protocol
  *
- *  OBJECTIVE-C LESSON: Nested message sends
- *    [[NSMenuItem alloc] initWithTitle:...]
- *  is the same as:
- *    NSMenuItem *item = [NSMenuItem alloc];  // step 1: allocate
- *    item = [item initWithTitle:...];        // step 2: initialize
- *  Just combined into one line.
+ *  NSOutlineView asks us these questions to build the tree:
+ *
+ *  1. "How many children does this item have?"
+ *     - If item == nil, return number of top-level items (servers)
+ *     - If item is a server node, return number of its sessions
+ *
+ *  2. "What is child number N of this item?"
+ *     - Return the HCServerNode or HCSessionNode at that index
+ *
+ *  3. "Is this item expandable?" (can it have children?)
+ *     - Servers are expandable, sessions are not
+ *
+ *  4. "What should I display for this item?"
+ *     - Return the name string
+ *
+ *  NSOutlineViewDelegate handles:
+ *  5. "The user clicked/selected a row — what should happen?"
+ *     - We switch to that session
  * ==========================================================================
  */
+
+@interface HCChannelTreeDataSource : NSObject
+	<NSOutlineViewDataSource, NSOutlineViewDelegate>
+@end
+
+@implementation HCChannelTreeDataSource
+
+/* How many children does this item have? */
+- (NSInteger)outlineView:(NSOutlineView *)outlineView
+	numberOfChildrenOfItem:(id)item
+{
+	if (item == nil)
+		return (NSInteger)[serverNodes count];  /* Top-level: servers */
+
+	if ([item isKindOfClass:[HCServerNode class]])
+		return (NSInteger)[((HCServerNode *)item).children count];
+
+	return 0;  /* Sessions have no children */
+}
+
+/* Return child at index. */
+- (id)outlineView:(NSOutlineView *)outlineView
+	child:(NSInteger)index
+	ofItem:(id)item
+{
+	if (item == nil)
+		return serverNodes[index];
+
+	if ([item isKindOfClass:[HCServerNode class]])
+		return ((HCServerNode *)item).children[index];
+
+	return nil;
+}
+
+/* Is this item expandable? */
+- (BOOL)outlineView:(NSOutlineView *)outlineView
+	isItemExpandable:(id)item
+{
+	return [item isKindOfClass:[HCServerNode class]];
+}
+
+/*
+ * What to display for this item?
+ *
+ * COCOA LESSON: NSTableColumn + objectValue
+ *
+ * NSOutlineView (and NSTableView) use "cell-based" or "view-based" mode.
+ * In cell-based mode (simpler), each cell asks for an "objectValue" —
+ * typically an NSString — and displays it as text.
+ */
+- (id)outlineView:(NSOutlineView *)outlineView
+	objectValueForTableColumn:(NSTableColumn *)tableColumn
+	byItem:(id)item
+{
+	if ([item isKindOfClass:[HCServerNode class]])
+		return ((HCServerNode *)item).name;
+
+	if ([item isKindOfClass:[HCSessionNode class]])
+		return ((HCSessionNode *)item).name;
+
+	return @"???";
+}
+
+/*
+ * User selected a row — switch to that session.
+ *
+ * COCOA LESSON: outlineViewSelectionDidChange:
+ *
+ * This delegate method is called AFTER the selection changes.
+ * We figure out which item was selected and switch to it.
+ */
+- (void)outlineViewSelectionDidChange:(NSNotification *)notification
+{
+	NSInteger row = [channelTree selectedRow];
+	if (row < 0)
+		return;
+
+	id item = [channelTree itemAtRow:row];
+
+	if ([item isKindOfClass:[HCSessionNode class]])
+	{
+		struct session *sess = ((HCSessionNode *)item).session;
+		if (sess)
+			switch_to_session (sess);
+	}
+	else if ([item isKindOfClass:[HCServerNode class]])
+	{
+		/* Clicked a server row — switch to the server session. */
+		struct server *serv = ((HCServerNode *)item).server;
+		if (serv && serv->server_session)
+			switch_to_session (serv->server_session);
+	}
+}
+
+@end
+
+
+/* ==========================================================================
+ *  HCUserListDataSource — Data source + delegate for the right sidebar
+ * ==========================================================================
+ *
+ *  Much simpler than the tree — it's a flat list of nicks.
+ *  We ask the current session's user_list_data (NSMutableArray) for
+ *  the number of rows and the string at each row.
+ * ==========================================================================
+ */
+
+@interface HCUserListDataSource : NSObject
+	<NSTableViewDataSource, NSTableViewDelegate>
+@end
+
+@implementation HCUserListDataSource
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+	NSMutableArray *users = get_user_list_data (current_sess);
+	return users ? (NSInteger)[users count] : 0;
+}
+
+- (id)tableView:(NSTableView *)tableView
+	objectValueForTableColumn:(NSTableColumn *)tableColumn
+	row:(NSInteger)row
+{
+	NSMutableArray *users = get_user_list_data (current_sess);
+	if (!users || row < 0 || row >= (NSInteger)[users count])
+		return @"";
+
+	return users[row];
+}
+
+@end
+
+
+/* ==========================================================================
+ *  WINDOW CREATION — Build the entire single-window UI
+ * ==========================================================================
+ */
+
+static void
+create_main_window (void)
+{
+	NSRect frame = NSMakeRect (100, 100, 1000, 650);
+	NSUInteger style = NSWindowStyleMaskTitled
+	                 | NSWindowStyleMaskClosable
+	                 | NSWindowStyleMaskResizable
+	                 | NSWindowStyleMaskMiniaturizable;
+
+	mainWindow = [[NSWindow alloc]
+		initWithContentRect:frame
+		styleMask:style
+		backing:NSBackingStoreBuffered
+		defer:NO];
+	[mainWindow setTitle:@"HexChat"];
+	[mainWindow setMinSize:NSMakeSize(600, 400)];
+
+	NSView *content = [mainWindow contentView];
+	NSRect bounds = [content bounds];
+
+	/*
+	 * LAYOUT: We use a simple autoresizing approach.
+	 *
+	 * The NSSplitView fills the top portion (all except 30px for input).
+	 * The NSTextField sits at the bottom.
+	 *
+	 *   +------+------------------+------+
+	 *   | tree | chat scroll view | user |  <- NSSplitView (3 subviews)
+	 *   |      |                  | list |
+	 *   +------+------------------+------+
+	 *   | input field                    |  <- NSTextField (fixed height)
+	 *   +--------------------------------+
+	 */
+
+	/* --- Input field (bottom, 28px tall) --- */
+	NSRect inputFrame = NSMakeRect (0, 0, bounds.size.width, 28);
+	inputField = [[NSTextField alloc] initWithFrame:inputFrame];
+	[inputField setPlaceholderString:@"Type a message or /command..."];
+	[inputField setFont:[NSFont monospacedSystemFontOfSize:12
+		weight:NSFontWeightRegular]];
+	[inputField setAutoresizingMask:NSViewWidthSizable];
+	[inputField setDelegate:(id<NSTextFieldDelegate>)inputDelegate];
+	[content addSubview:inputField];
+
+	/* --- Split view (fills everything above input) --- */
+	NSRect splitFrame = NSMakeRect (0, 28, bounds.size.width,
+		bounds.size.height - 28);
+
+	/*
+	 * COCOA LESSON: NSSplitView
+	 *
+	 * NSSplitView arranges its subviews side by side (horizontal) or
+	 * stacked (vertical). isVertical=YES means columns (left-to-right).
+	 *
+	 * You add subviews in order: first = leftmost, last = rightmost.
+	 * The user can drag the dividers to resize columns.
+	 */
+	splitView = [[NSSplitView alloc] initWithFrame:splitFrame];
+	[splitView setVertical:YES];          /* Columns, not rows.               */
+	[splitView setDividerStyle:NSSplitViewDividerStyleThin];
+	[splitView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+
+	/* --- LEFT PANE: Channel tree (NSOutlineView in NSScrollView) --- */
+	NSRect treeFrame = NSMakeRect (0, 0, 180, splitFrame.size.height);
+	channelTreeScroll = [[NSScrollView alloc] initWithFrame:treeFrame];
+	[channelTreeScroll setHasVerticalScroller:YES];
+	[channelTreeScroll setHasHorizontalScroller:NO];
+	[channelTreeScroll setAutoresizingMask:
+		(NSViewWidthSizable | NSViewHeightSizable)];
+
+	/*
+	 * COCOA LESSON: NSOutlineView
+	 *
+	 * NSOutlineView is a subclass of NSTableView that supports
+	 * hierarchical (tree) data. It shows disclosure triangles (▶/▼)
+	 * to expand/collapse parent rows.
+	 *
+	 * It needs at least one NSTableColumn to display text.
+	 * outlineTableColumn is the special column that shows the
+	 * disclosure triangles + indentation for child rows.
+	 */
+	channelTree = [[NSOutlineView alloc] initWithFrame:
+		[[channelTreeScroll contentView] bounds]];
+
+	NSTableColumn *treeCol = [[NSTableColumn alloc]
+		initWithIdentifier:@"channels"];
+	[treeCol setWidth:170];
+	[treeCol setTitle:@"Channels"];
+	[channelTree addTableColumn:treeCol];
+	[channelTree setOutlineTableColumn:treeCol];
+
+	/* Style: no header, source-list style (macOS sidebar look). */
+	[channelTree setHeaderView:nil];
+
+	[channelTree setDataSource:(id<NSOutlineViewDataSource>)treeDataSource];
+	[channelTree setDelegate:(id<NSOutlineViewDelegate>)treeDataSource];
+
+	[channelTreeScroll setDocumentView:channelTree];
+
+	/* --- CENTER PANE: Chat text view --- */
+	NSRect chatFrame = NSMakeRect (0, 0, 580, splitFrame.size.height);
+	chatScrollView = [[NSScrollView alloc] initWithFrame:chatFrame];
+	[chatScrollView setHasVerticalScroller:YES];
+	[chatScrollView setHasHorizontalScroller:NO];
+	[chatScrollView setAutoresizingMask:
+		(NSViewWidthSizable | NSViewHeightSizable)];
+
+	chatTextView = [[NSTextView alloc] initWithFrame:
+		[[chatScrollView contentView] bounds]];
+	[chatTextView setEditable:NO];
+	[chatTextView setSelectable:YES];
+	[chatTextView setRichText:YES];
+	[chatTextView setFont:[NSFont monospacedSystemFontOfSize:12
+		weight:NSFontWeightRegular]];
+	[chatTextView setBackgroundColor:
+		[NSColor colorWithWhite:0.1 alpha:1.0]];
+	[chatTextView setTextColor:
+		[NSColor colorWithWhite:0.9 alpha:1.0]];
+
+	/* Make text wrap to the view width. */
+	[chatTextView setMaxSize:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
+	[chatTextView setMinSize:NSMakeSize(0, chatFrame.size.height)];
+	[chatTextView setAutoresizingMask:NSViewWidthSizable];
+	[[chatTextView textContainer] setWidthTracksTextView:YES];
+
+	[chatScrollView setDocumentView:chatTextView];
+
+	/* --- RIGHT PANE: User list (NSTableView in NSScrollView) --- */
+	NSRect userFrame = NSMakeRect (0, 0, 140, splitFrame.size.height);
+	userListScroll = [[NSScrollView alloc] initWithFrame:userFrame];
+	[userListScroll setHasVerticalScroller:YES];
+	[userListScroll setHasHorizontalScroller:NO];
+	[userListScroll setAutoresizingMask:
+		(NSViewWidthSizable | NSViewHeightSizable)];
+
+	/*
+	 * COCOA LESSON: NSTableView
+	 *
+	 * A flat table (not hierarchical like NSOutlineView).
+	 * Perfect for a simple list of nicks.
+	 *
+	 * Like NSOutlineView, it uses a data source to ask
+	 * "how many rows?" and "what's in row N?"
+	 */
+	userListTable = [[NSTableView alloc] initWithFrame:
+		[[userListScroll contentView] bounds]];
+
+	NSTableColumn *userCol = [[NSTableColumn alloc]
+		initWithIdentifier:@"nicks"];
+	[userCol setWidth:130];
+	[userCol setTitle:@"Users"];
+	[userListTable addTableColumn:userCol];
+
+	[userListTable setHeaderView:nil];  /* No header row. */
+
+	[userListTable setDataSource:
+		(id<NSTableViewDataSource>)userListDataSource];
+	[userListTable setDelegate:
+		(id<NSTableViewDelegate>)userListDataSource];
+
+	[userListScroll setDocumentView:userListTable];
+
+	/* --- Assemble the split view (order = left, center, right) --- */
+	[splitView addSubview:channelTreeScroll];
+	[splitView addSubview:chatScrollView];
+	[splitView addSubview:userListScroll];
+
+	/*
+	 * Set initial divider positions.
+	 *
+	 * setPosition:ofDividerAtIndex: sets where a divider sits.
+	 * Divider 0 = between pane 0 and pane 1 (tree | chat)
+	 * Divider 1 = between pane 1 and pane 2 (chat | users)
+	 */
+	[splitView setPosition:180 ofDividerAtIndex:0];
+	[splitView setPosition:(bounds.size.width - 150) ofDividerAtIndex:1];
+
+	[content addSubview:splitView];
+
+	/* Show the window. */
+	[mainWindow makeKeyAndOrderFront:nil];
+	[mainWindow makeFirstResponder:inputField];
+}
+
+
+/* ==========================================================================
+ *  MENU BAR
+ * ==========================================================================
+ */
+
 static void
 create_menu_bar (void)
 {
-	/*
-	 * macOS menu structure:
-	 *   NSMenu (main menu bar)
-	 *     -> NSMenuItem (one per dropdown)
-	 *         -> NSMenu (the dropdown menu)
-	 *             -> NSMenuItem (individual items like "Quit")
-	 */
-
-	/* Create the main menu bar. */
 	NSMenu *menuBar = [[NSMenu alloc] init];
-
-	/* Create the "HexChat" application menu (first dropdown). */
 	NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
 	[menuBar addItem:appMenuItem];
 
-	/* Create the dropdown menu for the app menu item. */
 	NSMenu *appMenu = [[NSMenu alloc] init];
-
-	/*
-	 * Add "Quit HexChat" with Cmd+Q shortcut.
-	 *
-	 * @selector(terminate:) tells macOS "when clicked, call the
-	 * terminate: method on the target" — NSApp's terminate: will
-	 * trigger applicationShouldTerminate: on our delegate.
-	 *
-	 * keyEquivalent:@"q" with the default modifier (Cmd) = Cmd+Q.
-	 */
 	NSMenuItem *quitItem = [[NSMenuItem alloc]
 		initWithTitle:@"Quit HexChat"
 		action:@selector(terminate:)
 		keyEquivalent:@"q"];
 	[appMenu addItem:quitItem];
-
-	/* Wire it all together. */
 	[appMenuItem setSubmenu:appMenu];
+
 	[NSApp setMainMenu:menuBar];
 }
 
 
 /* ==========================================================================
+ *  SESSION SWITCHING — The core of the single-window architecture
+ * ==========================================================================
  *
- *                  THE fe_* FUNCTIONS — HexChat's Frontend API
+ *  When the user clicks a channel in the tree, we:
+ *  1. Save the current input text (if any)
+ *  2. Swap the text view's text storage to the new session's buffer
+ *  3. Reload the user list table
+ *  4. Update current_sess and window title
+ *  5. Restore the new session's input text
+ *  6. Scroll chat to the bottom
+ * ==========================================================================
+ */
+
+static void
+switch_to_session (struct session *sess)
+{
+	if (!sess || !sess->gui || sess == current_sess)
+		return;
+
+	@autoreleasepool
+	{
+		/* Step 1: Save current session's input text. */
+		if (current_sess && current_sess->gui)
+		{
+			const char *curText = [[inputField stringValue] UTF8String];
+			g_free (current_sess->gui->input_text);
+			current_sess->gui->input_text = g_strdup (curText ? curText : "");
+		}
+
+		/* Step 2: Update HexChat's session pointers. */
+		current_sess = sess;
+		current_tab = sess;
+		if (sess->server)
+			sess->server->front_session = sess;
+
+		/*
+		 * Step 3: Swap the text storage.
+		 *
+		 * COCOA LESSON: NSLayoutManager + replaceTextStorage
+		 *
+		 * NSTextView displays text via a chain:
+		 *   NSTextStorage → NSLayoutManager → NSTextContainer → NSTextView
+		 *
+		 * NSTextStorage holds the actual text data.
+		 * NSLayoutManager turns text into positioned glyphs.
+		 * NSTextContainer defines the region where text is laid out.
+		 * NSTextView renders everything on screen.
+		 *
+		 * To show different text, we swap the NSTextStorage.
+		 * The layout manager re-lays out from the new storage,
+		 * and the text view instantly shows different content.
+		 */
+		NSTextStorage *storage = get_text_storage (sess);
+		if (storage && chatTextView)
+		{
+			[[chatTextView layoutManager] replaceTextStorage:storage];
+
+			/* Scroll to the bottom. */
+			NSRange endRange = NSMakeRange ([[storage string] length], 0);
+			[chatTextView scrollRangeToVisible:endRange];
+		}
+
+		/* Step 4: Reload the user list for this session. */
+		[userListTable reloadData];
+
+		/* Step 5: Update window title. */
+		NSString *title;
+		if (sess->channel[0])
+			title = [NSString stringWithUTF8String:sess->channel];
+		else
+			title = @"HexChat";
+		[mainWindow setTitle:title];
+
+		/* Step 6: Restore this session's saved input text. */
+		if (sess->gui->input_text)
+			[inputField setStringValue:
+				[NSString stringWithUTF8String:sess->gui->input_text]];
+		else
+			[inputField setStringValue:@""];
+	}
+}
+
+
+/* ==========================================================================
+ *  CHANNEL TREE REFRESH — Rebuild the tree data from HexChat's sess_list
+ * ==========================================================================
  *
- *  Everything below implements the functions declared in src/common/fe.h.
- *  The backend calls these to interact with the UI.
+ *  We iterate through HexChat's global session list, group sessions by
+ *  server, and build HCServerNode/HCSessionNode objects.
+ * ==========================================================================
+ */
+
+static void
+refresh_channel_tree (void)
+{
+	@autoreleasepool
+	{
+		[serverNodes removeAllObjects];
+
+		/* Walk the global session list. */
+		GSList *slist;
+		for (slist = sess_list; slist; slist = slist->next)
+		{
+			struct session *sess = slist->data;
+			if (!sess || !sess->server)
+				continue;
+
+			/* Find or create the server node. */
+			HCServerNode *srvNode = nil;
+			for (HCServerNode *existing in serverNodes)
+			{
+				if (existing.server == sess->server)
+				{
+					srvNode = existing;
+					break;
+				}
+			}
+			if (!srvNode)
+			{
+				srvNode = [[HCServerNode alloc]
+					initWithServer:sess->server];
+				[serverNodes addObject:srvNode];
+			}
+
+			/* Add this session as a child. */
+			HCSessionNode *sessNode = [[HCSessionNode alloc]
+				initWithSession:sess];
+			[srvNode.children addObject:sessNode];
+		}
+
+		/* Reload and expand. */
+		[channelTree reloadData];
+		[channelTree expandItem:nil expandChildren:YES];
+
+		/*
+		 * Select the current session in the tree so the user
+		 * can see which channel is active.
+		 */
+		if (current_sess)
+		{
+			for (NSInteger i = 0; i < [channelTree numberOfRows]; i++)
+			{
+				id item = [channelTree itemAtRow:i];
+				if ([item isKindOfClass:[HCSessionNode class]] &&
+					((HCSessionNode *)item).session == current_sess)
+				{
+					[channelTree selectRowIndexes:
+						[NSIndexSet indexSetWithIndex:i]
+						byExtendingSelection:NO];
+					break;
+				}
+			}
+		}
+	}
+}
+
+
+/* ==========================================================================
+ *  USER LIST REFRESH — Rebuild the user array from HexChat's user tree
+ * ==========================================================================
+ */
+
+static void
+refresh_user_list (void)
+{
+	[userListTable reloadData];
+}
+
+/*
+ * Rebuild the NSMutableArray from the session's usertree.
  *
- *  We implement the critical ones fully, and stub out the rest.
- *  A "stub" is an empty function that satisfies the linker — the app
- *  won't crash, it just won't do anything for that feature yet.
+ * HexChat stores users in a balanced binary tree (tree *).
+ * We need to flatten it into our NSMutableArray.
+ */
+static void
+rebuild_user_list_data (struct session *sess)
+{
+	if (!sess || !sess->gui)
+		return;
+
+	NSMutableArray *users = get_user_list_data (sess);
+	if (!users)
+		return;
+
+	@autoreleasepool
+	{
+		[users removeAllObjects];
+
+		/* Walk the user tree. tree_foreach calls our callback for each user. */
+		tree *ut = sess->usertree;
+		if (ut)
+		{
+			/*
+			 * tree_foreach isn't available in all builds, so we use
+			 * the userlist count and just show the count in the title.
+			 * For the actual list, we iterate with tree_foreach.
+			 */
+			GList *list = userlist_double_list (sess);
+			GList *iter;
+			for (iter = list; iter; iter = iter->next)
+			{
+				struct User *user = iter->data;
+				if (user)
+				{
+					NSString *nick;
+					if (user->prefix[0])
+						nick = [NSString stringWithFormat:@"%c%s",
+							user->prefix[0], user->nick];
+					else
+						nick = [NSString stringWithUTF8String:user->nick];
+					if (nick)
+						[users addObject:nick];
+				}
+			}
+			g_list_free (list);
+		}
+	}
+}
+
+
+/* ==========================================================================
+ *
+ *                  THE fe_* FUNCTIONS — HexChat Frontend API
  *
  * ==========================================================================
  */
 
-
-/* --------------------------------------------------------------------------
- *  fe_args — Parse command-line arguments.
- *
- *  Called at the very start, before any UI is set up.
- *  Return -1 to continue startup, 0 or 1 to exit immediately.
- *
- *  This is identical to fe-text.c's version — command-line parsing
- *  is the same regardless of which UI we use.
- * -------------------------------------------------------------------------- */
+/* --- Command-line arguments (same as Phase 1) --- */
 
 static char *arg_cfgdir = NULL;
 static gint arg_show_autoload = 0;
@@ -530,7 +896,6 @@ fe_args (int argc, char *argv[])
 			printf ("%s\n", error->message);
 		return 1;
 	}
-
 	g_option_context_free (context);
 
 	if (arg_show_version)
@@ -538,7 +903,6 @@ fe_args (int argc, char *argv[])
 		printf (PACKAGE_NAME " " PACKAGE_VERSION "\n");
 		return 0;
 	}
-
 	if (arg_show_autoload)
 	{
 #ifdef USE_PLUGIN
@@ -548,13 +912,11 @@ fe_args (int argc, char *argv[])
 #endif
 		return 0;
 	}
-
 	if (arg_show_config)
 	{
 		printf ("%s\n", get_xdir ());
 		return 0;
 	}
-
 	if (arg_cfgdir)
 	{
 		g_free (xdir);
@@ -563,40 +925,21 @@ fe_args (int argc, char *argv[])
 			xdir[strlen (xdir) - 1] = 0;
 		g_free (arg_cfgdir);
 	}
-
-	return -1;  /* -1 = continue with normal startup */
+	return -1;
 }
 
 
 /* --------------------------------------------------------------------------
- *  fe_init — Called once after fe_args. Set up default preferences.
- *
- *  We disable some GUI features that don't exist yet in our frontend,
- *  and disable the server list dialog (we'll auto-connect or use commands).
+ *  fe_init — Bootstrap the Cocoa UI.
  * -------------------------------------------------------------------------- */
 void
 fe_init (void)
 {
-	/* Disable features we haven't built yet. */
-	prefs.hex_gui_tab_server = 0;      /* no server tabs yet              */
-	prefs.hex_gui_autoopen_dialog = 0; /* no auto-open dialog             */
-	prefs.hex_gui_lagometer = 0;       /* no lag meter widget yet         */
-	prefs.hex_gui_slist_skip = 1;      /* skip the server list on startup */
+	prefs.hex_gui_tab_server = 0;
+	prefs.hex_gui_autoopen_dialog = 0;
+	prefs.hex_gui_lagometer = 0;
+	prefs.hex_gui_slist_skip = 1;
 
-	/*
-	 * IMPORTANT: Bootstrap NSApplication and our delegates here in fe_init(),
-	 * not in fe_main(). Why? Because the backend creates sessions (and calls
-	 * fe_new_window) BETWEEN fe_init() and fe_main(). If we wait until
-	 * fe_main() to create the input delegate, it will be NULL when
-	 * fe_new_window() tries to use it — and the input field won't work!
-	 *
-	 * LESSON: Always think about initialization order:
-	 *   1. fe_args()         — parse command line
-	 *   2. fe_init()         — set up the UI toolkit  <-- WE ARE HERE
-	 *   3. backend init      — loads config, creates sessions
-	 *   4. fe_new_window()   — called for each session (needs delegates!)
-	 *   5. fe_main()         — start the event loop
-	 */
 	@autoreleasepool
 	{
 		[NSApplication sharedApplication];
@@ -604,9 +947,14 @@ fe_init (void)
 		appDelegate = [[HCAppDelegate alloc] init];
 		[NSApp setDelegate:appDelegate];
 
-		inputDel = [[HCInputDelegate alloc] init];
+		inputDelegate = [[HCInputDelegate alloc] init];
+		treeDataSource = [[HCChannelTreeDataSource alloc] init];
+		userListDataSource = [[HCUserListDataSource alloc] init];
+
+		serverNodes = [[NSMutableArray alloc] init];
 
 		create_menu_bar ();
+		create_main_window ();
 
 		[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 	}
@@ -614,98 +962,36 @@ fe_init (void)
 
 
 /* --------------------------------------------------------------------------
- *  fe_main — THE MAIN EVENT LOOP. This is the heart of the frontend.
- *
- *  In a Cocoa app, [NSApp run] is the main event loop — it processes
- *  mouse clicks, keyboard input, window events, timers, etc.
- *
- *  But HexChat's backend uses GLib for socket I/O (reading from IRC)
- *  and timers (reconnect delays, etc.). We need BOTH loops running.
- *
- *  Solution: we run Cocoa's loop (it's the boss) and use an NSTimer
- *  to periodically "pump" GLib's pending events. This is set up in
- *  applicationDidFinishLaunching: but we kick it off here too.
- *
- *  This function does NOT return until the app quits.
+ *  fe_main — Start the event loop.
  * -------------------------------------------------------------------------- */
 void
 fe_main (void)
 {
-	/*
-	 * OBJECTIVE-C LESSON: @autoreleasepool
-	 *
-	 * In Objective-C, objects can be "autoreleased" — marked for later
-	 * cleanup. The @autoreleasepool block defines a scope: when the
-	 * block exits, all autoreleased objects inside it are freed.
-	 *
-	 * Every thread that uses Objective-C objects needs at least one
-	 * autorelease pool. For the main thread, we wrap our app startup.
-	 */
 	@autoreleasepool
 	{
-		/*
-		 * NSApplication, delegates, and the menu bar were already set up
-		 * in fe_init(). Here we just need to:
-		 *   1. Start the GLib pump timer
-		 *   2. Enter the Cocoa event loop
-		 */
-
-		/*
-		 * Create the NSTimer that pumps GLib events.
-		 *
-		 * scheduledTimerWithTimeInterval: creates a timer that fires
-		 * repeatedly every 0.01 seconds (100 Hz).
-		 *
-		 * target:   = the object whose method to call
-		 * selector: = which method to call  (pumpGLib:)
-		 * userInfo: = extra data to pass (nil = none)
-		 * repeats:  = YES means it fires repeatedly (not just once)
-		 */
-		appDelegate.glibTimer = [NSTimer
+		((HCAppDelegate *)appDelegate).glibTimer = [NSTimer
 			scheduledTimerWithTimeInterval:0.01
 			target:appDelegate
 			selector:@selector(pumpGLib:)
 			userInfo:nil
 			repeats:YES];
 
-		/*
-		 * Activate the app — bring it to the front of all other apps.
-		 * We do this here (not in fe_init) because the windows are now
-		 * created and ready to be shown.
-		 */
 		[NSApp activateIgnoringOtherApps:YES];
-
-		/*
-		 * [NSApp run] — start the Cocoa event loop.
-		 * This call BLOCKS until the app quits (NSApp terminate: is called).
-		 * All UI events, timer firings, etc. happen inside here.
-		 */
 		[NSApp run];
 	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_cleanup — Called during shutdown. Free resources.
- * -------------------------------------------------------------------------- */
 void
 fe_cleanup (void)
 {
-	/* Stop the GLib pump timer. */
-	if (appDelegate.glibTimer)
+	if (((HCAppDelegate *)appDelegate).glibTimer)
 	{
-		[appDelegate.glibTimer invalidate];
-		appDelegate.glibTimer = nil;
+		[((HCAppDelegate *)appDelegate).glibTimer invalidate];
+		((HCAppDelegate *)appDelegate).glibTimer = nil;
 	}
 }
 
-
-/* --------------------------------------------------------------------------
- *  fe_exit — The backend wants us to quit.
- *
- *  We set the "done" flag. The next time pumpGLib: fires, it will see
- *  this flag and call [NSApp terminate:nil] to cleanly exit.
- * -------------------------------------------------------------------------- */
 void
 fe_exit (void)
 {
@@ -713,16 +999,7 @@ fe_exit (void)
 }
 
 
-/* --------------------------------------------------------------------------
- *  TIMERS AND I/O — Delegated to GLib
- *
- *  For Phase 1, we use GLib's timer and I/O functions, exactly like
- *  fe-text.c does. This is the path of least resistance — it works
- *  because our NSTimer pumps GLib's main context.
- *
- *  Later, we could replace these with NSTimer and dispatch_source_t
- *  for a "purer" Cocoa experience, but GLib works fine.
- * -------------------------------------------------------------------------- */
+/* --- Timers and I/O (unchanged from Phase 1) --- */
 
 int
 fe_timeout_add (int interval, void *callback, void *userdata)
@@ -736,79 +1013,42 @@ fe_timeout_add_seconds (int interval, void *callback, void *userdata)
 	return g_timeout_add_seconds (interval, (GSourceFunc) callback, userdata);
 }
 
-void
-fe_timeout_remove (int tag)
-{
-	g_source_remove (tag);
-}
+void fe_timeout_remove (int tag) { g_source_remove (tag); }
 
 int
 fe_input_add (int sok, int flags, void *func, void *data)
 {
 	int tag, type = 0;
-	GIOChannel *channel;
+	GIOChannel *channel = g_io_channel_unix_new (sok);
 
-	channel = g_io_channel_unix_new (sok);
-
-	if (flags & FIA_READ)
-		type |= G_IO_IN | G_IO_HUP | G_IO_ERR;
-	if (flags & FIA_WRITE)
-		type |= G_IO_OUT | G_IO_ERR;
-	if (flags & FIA_EX)
-		type |= G_IO_PRI;
+	if (flags & FIA_READ)  type |= G_IO_IN | G_IO_HUP | G_IO_ERR;
+	if (flags & FIA_WRITE) type |= G_IO_OUT | G_IO_ERR;
+	if (flags & FIA_EX)    type |= G_IO_PRI;
 
 	tag = g_io_add_watch (channel, type, (GIOFunc) func, data);
 	g_io_channel_unref (channel);
-
 	return tag;
 }
 
-void
-fe_input_remove (int tag)
-{
-	g_source_remove (tag);
-}
+void fe_input_remove (int tag) { g_source_remove (tag); }
 
-void
-fe_idle_add (void *func, void *data)
-{
-	g_idle_add (func, data);
-}
+void fe_idle_add (void *func, void *data) { g_idle_add (func, data); }
 
 
 /* --------------------------------------------------------------------------
- *  fe_new_window — Create a new chat window/tab.
+ *  fe_new_window — A new session was created.
  *
- *  This is called by the backend whenever a new session is created
- *  (joining a channel, opening a query, connecting to a server).
- *
- *  For Phase 1: one NSWindow per session, with a simple layout:
- *    +-----------------------------------------+
- *    | Topic bar (future)                      |
- *    +-----------------------------------------+
- *    |                              | User     |
- *    |  Chat text area              | List     |
- *    |  (NSTextView in              | (future) |
- *    |   NSScrollView)              |          |
- *    |                              |          |
- *    +-----------------------------------------+
- *    | [nick] [input field                   ] |
- *    +-----------------------------------------+
- *
- *  Later we'll add tabs (NSTabView or custom tab bar) so multiple
- *  sessions can share one window, like the GTK frontend does.
+ *  Phase 2: We no longer create a new window. Instead:
+ *  1. Allocate session_gui with its own NSTextStorage + user array
+ *  2. Add the session to the channel tree
+ *  3. If focused, switch to it
  * -------------------------------------------------------------------------- */
 void
 fe_new_window (struct session *sess, int focus)
 {
-	/*
-	 * STEP 1: Allocate the session_gui struct.
-	 * g_new0 is GLib's "allocate and zero-fill" — like calloc.
-	 */
 	session_gui *gui = g_new0 (session_gui, 1);
 	sess->gui = gui;
 
-	/* Set up session pointers (same as fe-text.c). */
 	if (!sess->server->front_session)
 		sess->server->front_session = sess;
 	if (!sess->server->server_session)
@@ -816,176 +1056,36 @@ fe_new_window (struct session *sess, int focus)
 	if (!current_tab || focus)
 		current_tab = sess;
 
-	current_sess = sess;
-
 	@autoreleasepool
 	{
 		/*
-		 * STEP 2: Create the window.
+		 * Create this session's text storage (its own chat buffer).
 		 *
-		 * NSMakeRect(x, y, width, height) defines the window's position
-		 * and size. In macOS, (0,0) is the BOTTOM-LEFT of the screen
-		 * (unlike most other systems where it's top-left).
-		 *
-		 * NSWindowStyleMask flags:
-		 *   Titled     = has a title bar
-		 *   Closable   = has a close button (red circle)
-		 *   Resizable  = can be resized by dragging edges
-		 *   Miniaturizable = has a minimize button (yellow circle)
-		 *
-		 * NSBackingStoreBuffered = double-buffered drawing (standard).
+		 * NSTextStorage is a subclass of NSMutableAttributedString.
+		 * Each session gets its own so text is preserved when switching.
 		 */
-		NSRect frame = NSMakeRect (200, 200, 800, 600);
-		NSUInteger style = NSWindowStyleMaskTitled
-		                 | NSWindowStyleMaskClosable
-		                 | NSWindowStyleMaskResizable
-		                 | NSWindowStyleMaskMiniaturizable;
+		NSTextStorage *storage = [[NSTextStorage alloc] init];
+		gui->text_storage = (void *)CFBridgingRetain (storage);
 
-		NSWindow *window = [[NSWindow alloc]
-			initWithContentRect:frame
-			styleMask:style
-			backing:NSBackingStoreBuffered
-			defer:NO];
+		/* Create the user list array. */
+		NSMutableArray *users = [[NSMutableArray alloc] init];
+		gui->user_list_data = (void *)CFBridgingRetain (users);
 
-		/*
-		 * Set the window title to the session's channel name,
-		 * or "HexChat" if there's no channel yet.
-		 */
-		if (sess->channel[0])
-			[window setTitle:[NSString stringWithUTF8String:sess->channel]];
-		else
-			[window setTitle:@"HexChat"];
+		/* Refresh the channel tree to include this new session. */
+		refresh_channel_tree ();
 
-		/*
-		 * STEP 3: Create the text view (where IRC messages appear).
-		 *
-		 * NSTextView needs to be inside an NSScrollView to be scrollable.
-		 * The scroll view handles scrollbars and clipping automatically.
-		 */
-		NSRect contentFrame = [[window contentView] bounds];
-
-		/* Reserve 30px at the bottom for the input field. */
-		NSRect scrollFrame = contentFrame;
-		scrollFrame.size.height -= 30;
-		scrollFrame.origin.y = 30;
-
-		NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:scrollFrame];
-		[scrollView setHasVerticalScroller:YES];
-		[scrollView setHasHorizontalScroller:NO];
-
-		/*
-		 * Enable autoresizing so the scroll view grows/shrinks with
-		 * the window. This is the "springs and struts" model:
-		 *   NSViewWidthSizable  = stretch horizontally
-		 *   NSViewHeightSizable = stretch vertically
-		 */
-		[scrollView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-
-		/*
-		 * Create the text view that goes inside the scroll view.
-		 * We make it non-editable (it's for display only — the user
-		 * types in the input field below, not in the chat area).
-		 */
-		NSTextView *textView = [[NSTextView alloc]
-			initWithFrame:[[scrollView contentView] bounds]];
-		[textView setEditable:NO];       /* Can't type in the chat area.       */
-		[textView setSelectable:YES];    /* Can select and copy text.          */
-		[textView setRichText:NO];       /* Plain text only (for now).         */
-
-		/*
-		 * Use a nice monospace font for IRC text.
-		 * systemFontOfSize:0 means "use the system default size".
-		 * We use monospacedSystemFontOfSize for a fixed-width font,
-		 * which makes IRC art and alignment look correct.
-		 */
-		[textView setFont:[NSFont monospacedSystemFontOfSize:12
-										  weight:NSFontWeightRegular]];
-
-		/* Dark background, light text — classic IRC look. */
-		[textView setBackgroundColor:[NSColor colorWithWhite:0.1 alpha:1.0]];
-		[textView setTextColor:[NSColor colorWithWhite:0.9 alpha:1.0]];
-
-		/*
-		 * Allow the text view to resize horizontally with the scroll view.
-		 * Without this, long lines would extend beyond the visible area.
-		 */
-		[textView setMaxSize:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
-		[textView setMinSize:NSMakeSize(0, scrollFrame.size.height)];
-		[textView setAutoresizingMask:NSViewWidthSizable];
-		[[textView textContainer] setWidthTracksTextView:YES];
-
-		/* Put the text view inside the scroll view. */
-		[scrollView setDocumentView:textView];
-
-		/*
-		 * STEP 4: Create the input field (where user types messages).
-		 *
-		 * NSTextField can be a label OR an input box. By default it's
-		 * an input box. We place it at the bottom of the window.
-		 */
-		NSRect inputFrame = NSMakeRect (0, 0, contentFrame.size.width, 28);
-		NSTextField *inputField = [[NSTextField alloc] initWithFrame:inputFrame];
-
-		/*
-		 * setPlaceholderString — ghost text shown when the field is empty.
-		 * Like HTML's <input placeholder="...">.
-		 */
-		[inputField setPlaceholderString:@"Type a message or /command..."];
-		[inputField setFont:[NSFont monospacedSystemFontOfSize:12
-											 weight:NSFontWeightRegular]];
-
-		/* Make the input field stretch horizontally with the window. */
-		[inputField setAutoresizingMask:NSViewWidthSizable];
-
-		/* Connect our delegate so we get notified when Enter is pressed. */
-		[inputField setDelegate:(id<NSTextFieldDelegate>)inputDel];
-
-		/*
-		 * STEP 5: Add everything to the window.
-		 *
-		 * [window contentView] is the "content area" of the window
-		 * (everything below the title bar).
-		 */
-		[[window contentView] addSubview:scrollView];
-		[[window contentView] addSubview:inputField];
-
-		/*
-		 * STEP 6: Store Cocoa objects in the session_gui struct.
-		 *
-		 * CFBridgingRetain — tells ARC "I'm storing this in a void* field,
-		 * so keep it alive (don't free it)".
-		 */
-		gui->window      = (void *)CFBridgingRetain (window);
-		gui->text_view   = (void *)CFBridgingRetain (textView);
-		gui->scroll_view = (void *)CFBridgingRetain (scrollView);
-		gui->input_field = (void *)CFBridgingRetain (inputField);
-
-		/*
-		 * STEP 7: Show the window.
-		 *
-		 * makeKeyAndOrderFront: makes the window:
-		 *   "key" = receives keyboard input
-		 *   "order front" = visible and in front of other windows
-		 *
-		 * makeFirstResponder: sets keyboard focus to the input field
-		 * so the user can start typing immediately.
-		 */
-		if (focus)
+		/* If this should be focused, switch to it. */
+		if (focus || !current_sess)
 		{
-			[window makeKeyAndOrderFront:nil];
-			[window makeFirstResponder:inputField];
-		}
-		else
-		{
-			[window orderFront:nil];
+			current_sess = sess;
+			switch_to_session (sess);
 		}
 	}
 
-	/* Show the intro banner (once). */
+	/* Show intro banner (once). */
 	if (!done_intro)
 	{
 		done_intro = 1;
-
 		char buf[512];
 		g_snprintf (buf, sizeof (buf),
 			"\n"
@@ -997,9 +1097,6 @@ fe_new_window (struct session *sess, int focus)
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_new_server — Allocate server_gui for a new server connection.
- * -------------------------------------------------------------------------- */
 void
 fe_new_server (struct server *serv)
 {
@@ -1008,41 +1105,25 @@ fe_new_server (struct server *serv)
 
 
 /* --------------------------------------------------------------------------
- *  fe_print_text — Display text in the chat area.
+ *  fe_print_text — Append text to the session's text storage.
  *
- *  This is THE most important display function. The backend calls this
- *  every time there's a message to show (chat messages, joins, parts,
- *  status messages, etc.).
- *
- *  The text contains mIRC color codes (^C, ^B, ^O, etc.) that we need
- *  to either render or strip. For Phase 1, we strip them and just show
- *  plain text. Color support comes later!
+ *  Phase 2 change: We write to the session's OWN text storage,
+ *  not directly to the text view. If this session is currently
+ *  visible, the change appears immediately (because the layout
+ *  manager is connected to this storage). If not, the text is
+ *  buffered and appears when the user switches to this session.
  * -------------------------------------------------------------------------- */
 void
 fe_print_text (struct session *sess, char *text, time_t stamp,
                gboolean no_activity)
 {
-	NSTextView *textView = get_text_view (sess);
-	if (!textView)
+	NSTextStorage *storage = get_text_storage (sess);
+	if (!storage)
 		return;
 
 	@autoreleasepool
 	{
-		/*
-		 * Strip mIRC formatting codes.
-		 *
-		 * mIRC uses control characters for formatting:
-		 *   \003 (^C) = color code, followed by digits
-		 *   \002 (^B) = bold toggle
-		 *   \017 (^O) = reset all formatting
-		 *   \026 (^V) = reverse/italic toggle
-		 *   \037 (^_) = underline toggle
-		 *   \010 (^H) = hidden text
-		 *
-		 * For now, we just strip them all out.
-		 * In a future phase, we'll convert them to NSAttributedString
-		 * attributes (bold, colored text, etc.).
-		 */
+		/* Strip mIRC formatting codes. */
 		int len = strlen (text);
 		char *clean = g_malloc (len + 1);
 		int i = 0, j = 0;
@@ -1051,25 +1132,20 @@ fe_print_text (struct session *sess, char *text, time_t stamp,
 		{
 			switch (text[i])
 			{
-			case '\003':  /* color code */
+			case '\003':
 				i++;
-				/* Skip up to 2 digits (foreground color). */
 				if (i < len && text[i] >= '0' && text[i] <= '9') i++;
 				if (i < len && text[i] >= '0' && text[i] <= '9') i++;
-				/* Skip comma and up to 2 digits (background color). */
 				if (i < len && text[i] == ',')
 				{
 					i++;
 					if (i < len && text[i] >= '0' && text[i] <= '9') i++;
 					if (i < len && text[i] >= '0' && text[i] <= '9') i++;
 				}
-				continue;  /* Don't increment i at the end of the loop. */
-			case '\002':  /* bold */
-			case '\017':  /* reset */
-			case '\026':  /* reverse */
-			case '\037':  /* underline */
-			case '\010':  /* hidden */
-				break;    /* Skip this character. */
+				continue;
+			case '\002': case '\017': case '\026':
+			case '\037': case '\010':
+				break;
 			default:
 				clean[j++] = text[i];
 				break;
@@ -1078,49 +1154,13 @@ fe_print_text (struct session *sess, char *text, time_t stamp,
 		}
 		clean[j] = '\0';
 
-		/*
-		 * Append the cleaned text to the text view.
-		 *
-		 * OBJECTIVE-C LESSON: NSTextStorage
-		 *
-		 * NSTextView uses a "model-view" architecture:
-		 *   - NSTextStorage holds the text data (the model)
-		 *   - NSTextView renders it on screen (the view)
-		 *
-		 * To modify text, we go through the textStorage:
-		 *   1. Get the storage: [textView textStorage]
-		 *   2. Begin editing:   [storage beginEditing]
-		 *   3. Append text:     [storage appendAttributedString:...]
-		 *   4. End editing:     [storage endEditing]
-		 *
-		 * NSAttributedString = text + formatting attributes (font, color, etc.)
-		 * NSString           = just text
-		 *
-		 * We create an NSAttributedString with our font/color settings.
-		 */
 		NSString *nsText = [NSString stringWithUTF8String:clean];
 		if (!nsText)
-		{
-			/* If the text isn't valid UTF-8, try Latin-1 as fallback. */
-			nsText = [[NSString alloc]
-				initWithBytes:clean
-				length:j
+			nsText = [[NSString alloc] initWithBytes:clean length:j
 				encoding:NSISOLatin1StringEncoding];
-		}
 		g_free (clean);
+		if (!nsText) return;
 
-		if (!nsText)
-			return;
-
-		/*
-		 * NSDictionary — a key-value container (like Python's dict).
-		 * Here we use it to specify text attributes:
-		 *   NSForegroundColorAttributeName = text color
-		 *   NSFontAttributeName = font
-		 *
-		 * The @{ key: value, ... } syntax is an Objective-C literal
-		 * for creating an NSDictionary.
-		 */
 		NSDictionary *attrs = @{
 			NSForegroundColorAttributeName:
 				[NSColor colorWithWhite:0.9 alpha:1.0],
@@ -1132,39 +1172,25 @@ fe_print_text (struct session *sess, char *text, time_t stamp,
 		NSAttributedString *attrText = [[NSAttributedString alloc]
 			initWithString:nsText attributes:attrs];
 
-		/*
-		 * OBJECTIVE-C LESSON: dispatch_async to main thread
-		 *
-		 * UI updates in macOS MUST happen on the main thread.
-		 * The backend might call fe_print_text from a callback running
-		 * on a GLib thread. To be safe, we dispatch to the main queue.
-		 *
-		 * dispatch_get_main_queue() = the main thread's dispatch queue
-		 * dispatch_async = "run this block later on that queue"
-		 *
-		 * The ^{ ... } syntax is a "block" — like a lambda/closure.
-		 * It captures variables from the surrounding scope.
-		 */
 		dispatch_async (dispatch_get_main_queue (), ^{
-			NSTextStorage *storage = [textView textStorage];
 			[storage beginEditing];
 			[storage appendAttributedString:attrText];
 			[storage endEditing];
 
-			/*
-			 * Scroll to the bottom so the newest text is visible.
-			 * [textView scrollRangeToVisible:...] scrolls to show the
-			 * given range. We use the very end of the text.
-			 */
-			NSRange endRange = NSMakeRange ([[storage string] length], 0);
-			[textView scrollRangeToVisible:endRange];
+			/* If this is the visible session, scroll to bottom. */
+			if (sess == current_sess && chatTextView)
+			{
+				NSRange endRange = NSMakeRange (
+					[[storage string] length], 0);
+				[chatTextView scrollRangeToVisible:endRange];
+			}
 		});
 	}
 }
 
 
 /* --------------------------------------------------------------------------
- *  fe_close_window — Close a session's window and free its GUI resources.
+ *  fe_close_window — Session closed. Remove from tree, free resources.
  * -------------------------------------------------------------------------- */
 void
 fe_close_window (struct session *sess)
@@ -1173,28 +1199,11 @@ fe_close_window (struct session *sess)
 	{
 		@autoreleasepool
 		{
-			/*
-			 * Close the NSWindow. orderOut removes it from screen.
-			 * CFBridgingRelease transfers ownership back to ARC,
-			 * which will free the object when its reference count
-			 * hits zero.
-			 */
-			NSWindow *window = get_window (sess);
-			if (window)
-				[window orderOut:nil];
-
-			/* Release all retained Cocoa objects. */
-			if (sess->gui->window)
-				CFBridgingRelease (sess->gui->window);
-			if (sess->gui->text_view)
-				CFBridgingRelease (sess->gui->text_view);
-			if (sess->gui->scroll_view)
-				CFBridgingRelease (sess->gui->scroll_view);
-			if (sess->gui->input_field)
-				CFBridgingRelease (sess->gui->input_field);
+			if (sess->gui->text_storage)
+				CFBridgingRelease (sess->gui->text_storage);
+			if (sess->gui->user_list_data)
+				CFBridgingRelease (sess->gui->user_list_data);
 		}
-
-		/* Free the C struct itself. */
 		g_free (sess->gui->input_text);
 		g_free (sess->gui->topic_text);
 		g_free (sess->gui);
@@ -1202,32 +1211,22 @@ fe_close_window (struct session *sess)
 	}
 
 	session_free (sess);
+
+	/* Refresh tree after removal. */
+	dispatch_async (dispatch_get_main_queue (), ^{
+		refresh_channel_tree ();
+	});
 }
 
 
 /* --------------------------------------------------------------------------
- *  fe_message — Show a simple message (info, warning, error).
- *
- *  For now, just print to stdout. Later, this could be an NSAlert dialog.
- * -------------------------------------------------------------------------- */
-void
-fe_message (char *msg, int flags)
-{
-	puts (msg);
-}
-
-
-/* --------------------------------------------------------------------------
- *  fe_set_topic — The backend tells us the channel topic changed.
+ *  fe_set_topic — Channel topic changed.
  * -------------------------------------------------------------------------- */
 void
 fe_set_topic (struct session *sess, char *topic, char *stripped_topic)
 {
-	/* Future: update the topic bar in the window. */
-	NSWindow *window = get_window (sess);
-	if (window && stripped_topic)
+	if (sess == current_sess && mainWindow && stripped_topic)
 	{
-		/* For now, append the topic to the window title. */
 		dispatch_async (dispatch_get_main_queue (), ^{
 			NSString *title;
 			if (sess->channel[0])
@@ -1235,347 +1234,220 @@ fe_set_topic (struct session *sess, char *topic, char *stripped_topic)
 					sess->channel, stripped_topic];
 			else
 				title = [NSString stringWithUTF8String:stripped_topic];
-			[window setTitle:title];
+			[mainWindow setTitle:title];
 		});
 	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_set_title — Update the window title.
- * -------------------------------------------------------------------------- */
 void
 fe_set_title (struct session *sess)
 {
-	NSWindow *window = get_window (sess);
-	if (window)
+	if (sess == current_sess && mainWindow)
 	{
 		dispatch_async (dispatch_get_main_queue (), ^{
-			NSString *title;
-			if (sess->channel[0])
-				title = [NSString stringWithUTF8String:sess->channel];
-			else
-				title = @"HexChat";
-			[window setTitle:title];
+			NSString *t = sess->channel[0]
+				? [NSString stringWithUTF8String:sess->channel]
+				: @"HexChat";
+			[mainWindow setTitle:t];
 		});
 	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_set_channel — The session's channel name changed.
- * -------------------------------------------------------------------------- */
 void
 fe_set_channel (struct session *sess)
 {
 	fe_set_title (sess);
+	/* Also refresh the tree so the channel name updates. */
+	dispatch_async (dispatch_get_main_queue (), ^{
+		refresh_channel_tree ();
+	});
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_set_nick — Your nickname changed on this server.
- * -------------------------------------------------------------------------- */
-void
-fe_set_nick (struct server *serv, char *newnick)
-{
-	/* Future: update the nick label in all sessions for this server. */
-}
+void fe_set_nick (struct server *serv, char *newnick) {}
 
 
-/* --------------------------------------------------------------------------
- *  fe_beep — Play a beep sound.
- * -------------------------------------------------------------------------- */
 void
 fe_beep (session *sess)
 {
-	NSBeep ();   /* macOS system beep */
+	NSBeep ();
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_open_url — Open a URL in the user's default browser.
- * -------------------------------------------------------------------------- */
 void
 fe_open_url (const char *url)
 {
-	if (!url)
-		return;
-
+	if (!url) return;
 	@autoreleasepool
 	{
-		/*
-		 * NSURL + NSWorkspace: the standard way to open URLs on macOS.
-		 *
-		 * NSWorkspace is a singleton that talks to the macOS Finder/system.
-		 * openURL: launches the default browser with the given URL.
-		 */
-		NSString *urlStr = [NSString stringWithUTF8String:url];
-		NSURL *nsurl = [NSURL URLWithString:urlStr];
+		NSURL *nsurl = [NSURL URLWithString:
+			[NSString stringWithUTF8String:url]];
 		if (nsurl)
 			[[NSWorkspace sharedWorkspace] openURL:nsurl];
 	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_ctrl_gui — Control the GUI (show, hide, focus, iconify, etc.).
- * -------------------------------------------------------------------------- */
 void
 fe_ctrl_gui (session *sess, fe_gui_action action, int arg)
 {
-	NSWindow *window = get_window (sess);
-
 	switch (action)
 	{
-	case FE_GUI_HIDE:
-		if (window)
-			dispatch_async (dispatch_get_main_queue (), ^{
-				[window orderOut:nil];
-			});
-		break;
-
-	case FE_GUI_SHOW:
-		if (window)
-			dispatch_async (dispatch_get_main_queue (), ^{
-				[window makeKeyAndOrderFront:nil];
-			});
-		break;
-
 	case FE_GUI_FOCUS:
-		current_sess = sess;
-		current_tab = sess;
-		if (sess->server)
-			sess->server->front_session = sess;
-		if (window)
+		switch_to_session (sess);
+		if (mainWindow)
 			dispatch_async (dispatch_get_main_queue (), ^{
-				[window makeKeyAndOrderFront:nil];
+				[mainWindow makeKeyAndOrderFront:nil];
 			});
 		break;
-
+	case FE_GUI_HIDE:
+		if (mainWindow)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[mainWindow orderOut:nil];
+			});
+		break;
+	case FE_GUI_SHOW:
+		if (mainWindow)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[mainWindow makeKeyAndOrderFront:nil];
+			});
+		break;
 	case FE_GUI_ICONIFY:
-		if (window)
+		if (mainWindow)
 			dispatch_async (dispatch_get_main_queue (), ^{
-				[window miniaturize:nil];
+				[mainWindow miniaturize:nil];
 			});
 		break;
-
 	default:
 		break;
 	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_gui_info — Return information about the GUI state.
- * -------------------------------------------------------------------------- */
-int
-fe_gui_info (session *sess, int info_type)
-{
-	return -1;  /* -1 = unknown/not implemented */
-}
+int  fe_gui_info (session *sess, int info_type) { return -1; }
+void *fe_gui_info_ptr (session *sess, int info_type) { return NULL; }
+
+void fe_message (char *msg, int flags) { puts (msg); }
 
 
-void *
-fe_gui_info_ptr (session *sess, int info_type)
-{
-	return NULL;
-}
+/* --- Input box --- */
 
-
-/* --------------------------------------------------------------------------
- *  fe_get_inputbox_contents / fe_set_inputbox_contents
- *
- *  The backend sometimes needs to read or modify the input field
- *  (e.g., for tab completion, command history).
- * -------------------------------------------------------------------------- */
 char *
 fe_get_inputbox_contents (struct session *sess)
 {
-	NSTextField *field = get_input_field (sess);
-	if (!field)
+	if (!inputField)
 		return g_strdup ("");
 
 	__block char *result = NULL;
-
-	/*
-	 * OBJECTIVE-C LESSON: dispatch_sync
-	 *
-	 * Like dispatch_async, but WAITS for the block to finish.
-	 * We need this because the caller expects a return value.
-	 * Must be careful: calling dispatch_sync on the main thread
-	 * FROM the main thread would deadlock!
-	 */
 	if ([NSThread isMainThread])
 	{
-		const char *text = [[field stringValue] UTF8String];
-		result = g_strdup (text ? text : "");
+		const char *t = [[inputField stringValue] UTF8String];
+		result = g_strdup (t ? t : "");
 	}
 	else
 	{
 		dispatch_sync (dispatch_get_main_queue (), ^{
-			const char *text = [[field stringValue] UTF8String];
-			result = g_strdup (text ? text : "");
+			const char *t = [[inputField stringValue] UTF8String];
+			result = g_strdup (t ? t : "");
 		});
 	}
-
 	return result;
 }
 
-int
-fe_get_inputbox_cursor (struct session *sess)
-{
-	/* Future: return the cursor position in the input field. */
-	return 0;
-}
+int fe_get_inputbox_cursor (struct session *sess) { return 0; }
 
 void
 fe_set_inputbox_contents (struct session *sess, char *text)
 {
-	NSTextField *field = get_input_field (sess);
-	if (!field || !text)
-		return;
-
+	if (!inputField || !text) return;
+	if (sess != current_sess) return;  /* Only update if visible. */
 	dispatch_async (dispatch_get_main_queue (), ^{
-		[field setStringValue:[NSString stringWithUTF8String:text]];
+		[inputField setStringValue:
+			[NSString stringWithUTF8String:text]];
 	});
 }
 
-void
-fe_set_inputbox_cursor (struct session *sess, int delta, int pos)
-{
-	/* Future: move the cursor in the input field. */
-}
+void fe_set_inputbox_cursor (struct session *sess, int delta, int pos) {}
 
 
-/* --------------------------------------------------------------------------
- *  fe_flash_window — Flash the Dock icon to get the user's attention.
- * -------------------------------------------------------------------------- */
 void
 fe_flash_window (struct session *sess)
 {
-	/*
-	 * requestUserAttention: makes the Dock icon bounce.
-	 * NSInformationalRequest = bounce once (vs. NSCriticalRequest = keep bouncing)
-	 */
 	dispatch_async (dispatch_get_main_queue (), ^{
 		[NSApp requestUserAttention:NSInformationalRequest];
 	});
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_text_clear — Clear the chat text area.
- * -------------------------------------------------------------------------- */
 void
 fe_text_clear (struct session *sess, int lines)
 {
-	NSTextView *textView = get_text_view (sess);
-	if (!textView)
-		return;
-
+	NSTextStorage *storage = get_text_storage (sess);
+	if (!storage) return;
 	dispatch_async (dispatch_get_main_queue (), ^{
 		if (lines == 0)
-		{
-			/* Clear all text. */
-			[[textView textStorage] setAttributedString:
+			[storage setAttributedString:
 				[[NSAttributedString alloc] initWithString:@""]];
-		}
-		/* Future: if lines > 0, remove only that many lines from the top. */
 	});
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_confirm — Ask user a yes/no question.
- *
- *  Shows a macOS alert dialog.
- * -------------------------------------------------------------------------- */
 void
 fe_confirm (const char *message, void (*yesproc)(void *),
             void (*noproc)(void *), void *ud)
 {
-	if (!message)
-		return;
-
+	if (!message) return;
 	dispatch_async (dispatch_get_main_queue (), ^{
-		@autoreleasepool
-		{
-			/*
-			 * NSAlert — a standard macOS dialog box.
-			 *
-			 * setMessageText:    — the main question (big text)
-			 * addButtonWithTitle: — add buttons (first one is default)
-			 *
-			 * runModal returns which button was clicked.
-			 * NSAlertFirstButtonReturn = the first button we added ("Yes").
-			 */
+		@autoreleasepool {
 			NSAlert *alert = [[NSAlert alloc] init];
 			[alert setMessageText:[NSString stringWithUTF8String:message]];
 			[alert addButtonWithTitle:@"Yes"];
 			[alert addButtonWithTitle:@"No"];
-
-			NSModalResponse response = [alert runModal];
-			if (response == NSAlertFirstButtonReturn)
+			if ([alert runModal] == NSAlertFirstButtonReturn)
 			{
-				if (yesproc)
-					yesproc (ud);
+				if (yesproc) yesproc (ud);
 			}
 			else
 			{
-				if (noproc)
-					noproc (ud);
+				if (noproc) noproc (ud);
 			}
 		}
 	});
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_get_file — Open a file picker dialog.
- * -------------------------------------------------------------------------- */
 void
 fe_get_file (const char *title, char *initial,
              void (*callback)(void *userdata, char *file), void *userdata,
              int flags)
 {
 	dispatch_async (dispatch_get_main_queue (), ^{
-		@autoreleasepool
-		{
+		@autoreleasepool {
 			if (flags & FRF_WRITE)
 			{
-				/* Save dialog. */
-				NSSavePanel *panel = [NSSavePanel savePanel];
-				if (title)
-					[panel setTitle:[NSString stringWithUTF8String:title]];
-
-				if ([panel runModal] == NSModalResponseOK)
+				NSSavePanel *p = [NSSavePanel savePanel];
+				if (title) [p setTitle:[NSString stringWithUTF8String:title]];
+				if ([p runModal] == NSModalResponseOK)
 				{
-					const char *path = [[[panel URL] path] UTF8String];
-					if (path && callback)
-						callback (userdata, (char *)path);
+					const char *path = [[[p URL] path] UTF8String];
+					if (path && callback) callback (userdata, (char *)path);
 				}
 			}
 			else
 			{
-				/* Open dialog. */
-				NSOpenPanel *panel = [NSOpenPanel openPanel];
-				if (title)
-					[panel setTitle:[NSString stringWithUTF8String:title]];
-
-				[panel setAllowsMultipleSelection:
-					(flags & FRF_MULTIPLE) ? YES : NO];
-				[panel setCanChooseDirectories:
-					(flags & FRF_CHOOSEFOLDER) ? YES : NO];
-				[panel setCanChooseFiles:
-					(flags & FRF_CHOOSEFOLDER) ? NO : YES];
-
-				if ([panel runModal] == NSModalResponseOK)
+				NSOpenPanel *p = [NSOpenPanel openPanel];
+				if (title) [p setTitle:[NSString stringWithUTF8String:title]];
+				[p setAllowsMultipleSelection:(flags & FRF_MULTIPLE) ? YES : NO];
+				[p setCanChooseDirectories:(flags & FRF_CHOOSEFOLDER) ? YES : NO];
+				[p setCanChooseFiles:(flags & FRF_CHOOSEFOLDER) ? NO : YES];
+				if ([p runModal] == NSModalResponseOK)
 				{
-					for (NSURL *url in [panel URLs])
+					for (NSURL *url in [p URLs])
 					{
 						const char *path = [[url path] UTF8String];
-						if (path && callback)
-							callback (userdata, (char *)path);
+						if (path && callback) callback (userdata, (char *)path);
 					}
 				}
 			}
@@ -1584,87 +1456,148 @@ fe_get_file (const char *title, char *initial,
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_get_default_font — Return the default font name for IRC text.
- * -------------------------------------------------------------------------- */
-const char *
-fe_get_default_font (void)
-{
-	return "Menlo 12";  /* macOS's default monospace font */
-}
+const char *fe_get_default_font (void) { return "Menlo 12"; }
 
-
-/* --------------------------------------------------------------------------
- *  fe_server_event — Server connection state changed.
- * -------------------------------------------------------------------------- */
 void
 fe_server_event (server *serv, int type, int arg)
 {
-	/* Future: update status bar or connection indicator. */
+	/* Refresh tree when server connects (name becomes available). */
+	dispatch_async (dispatch_get_main_queue (), ^{
+		refresh_channel_tree ();
+	});
+}
+
+void fe_get_bool (char *title, char *prompt, void *callback, void *userdata) {}
+void fe_get_str (char *prompt, char *def, void *callback, void *ud) {}
+void fe_get_int (char *prompt, int def, void *callback, void *ud) {}
+
+
+/* ==========================================================================
+ *  USER LIST FUNCTIONS — Phase 2 implementations
+ * ==========================================================================
+ */
+
+void
+fe_userlist_insert (struct session *sess, struct User *newuser, gboolean sel)
+{
+	NSMutableArray *users = get_user_list_data (sess);
+	if (!users || !newuser)
+		return;
+
+	@autoreleasepool
+	{
+		NSString *nick;
+		if (newuser->prefix[0])
+			nick = [NSString stringWithFormat:@"%c%s",
+				newuser->prefix[0], newuser->nick];
+		else
+			nick = [NSString stringWithUTF8String:newuser->nick];
+
+		if (nick)
+			[users addObject:nick];
+
+		if (sess == current_sess)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[userListTable reloadData];
+			});
+	}
 }
 
 
-/* --------------------------------------------------------------------------
- *  fe_get_bool / fe_get_str / fe_get_int — Prompt dialogs.
- * -------------------------------------------------------------------------- */
-void
-fe_get_bool (char *title, char *prompt, void *callback, void *userdata)
+int
+fe_userlist_remove (struct session *sess, struct User *user)
 {
-	/* Future: show an NSAlert with Yes/No buttons. */
+	NSMutableArray *users = get_user_list_data (sess);
+	if (!users || !user)
+		return 0;
+
+	@autoreleasepool
+	{
+		/* Find and remove the nick. */
+		NSString *target = [NSString stringWithUTF8String:user->nick];
+		for (NSInteger i = (NSInteger)[users count] - 1; i >= 0; i--)
+		{
+			NSString *entry = users[i];
+			/* Entry might have a prefix char, so check if it ends with the nick. */
+			if ([entry isEqualToString:target] ||
+				([entry length] > 0 && [[entry substringFromIndex:1] isEqualToString:target]))
+			{
+				[users removeObjectAtIndex:i];
+				break;
+			}
+		}
+
+		if (sess == current_sess)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[userListTable reloadData];
+			});
+	}
+	return 0;
 }
 
-void
-fe_get_str (char *prompt, char *def, void *callback, void *ud)
-{
-	/* Future: show an NSAlert with a text input field. */
-}
 
 void
-fe_get_int (char *prompt, int def, void *callback, void *ud)
+fe_userlist_rehash (struct session *sess, struct User *user)
 {
-	/* Future: show an NSAlert with a number input field. */
+	/* Rebuild the entire list (prefix may have changed). */
+	rebuild_user_list_data (sess);
+	if (sess == current_sess)
+		dispatch_async (dispatch_get_main_queue (), ^{
+			[userListTable reloadData];
+		});
+}
+
+
+void
+fe_userlist_update (session *sess, struct User *user)
+{
+	fe_userlist_rehash (sess, user);
+}
+
+
+void
+fe_userlist_numbers (struct session *sess)
+{
+	/* Could update a "N users" label. For now, just refresh. */
+	if (sess == current_sess)
+		dispatch_async (dispatch_get_main_queue (), ^{
+			[userListTable reloadData];
+		});
+}
+
+
+void
+fe_userlist_clear (struct session *sess)
+{
+	NSMutableArray *users = get_user_list_data (sess);
+	if (users)
+		[users removeAllObjects];
+
+	if (sess == current_sess)
+		dispatch_async (dispatch_get_main_queue (), ^{
+			[userListTable reloadData];
+		});
 }
 
 
 /* ==========================================================================
- *  STUBS — Functions that do nothing yet.
- *
- *  These satisfy the linker so the app compiles and runs.
- *  Each one represents a feature we'll implement in a future phase:
- *
- *  Phase 2: User list (fe_userlist_*)
- *  Phase 3: Channel list (fe_add_chan_list, fe_chan_list_end)
- *  Phase 4: DCC file transfer UI (fe_dcc_*)
- *  Phase 5: Ban list, ignore list
- *  Phase 6: Menus, tray icon, notifications
+ *  REMAINING STUBS
  * ==========================================================================
  */
 
-/* --- User list (Phase 2) --- */
-void fe_userlist_insert (struct session *sess, struct User *newuser, gboolean sel) {}
-int  fe_userlist_remove (struct session *sess, struct User *user) { return 0; }
-void fe_userlist_rehash (struct session *sess, struct User *user) {}
-void fe_userlist_update (session *sess, struct User *user) {}
-void fe_userlist_numbers (struct session *sess) {}
-void fe_userlist_clear (struct session *sess) {}
 void fe_userlist_set_selected (struct session *sess) {}
 void fe_uselect (struct session *sess, char *word[], int do_clear, int scroll_to) {}
 
-/* --- Channel list (Phase 3) --- */
 int  fe_is_chanwindow (struct server *serv) { return 0; }
 void fe_add_chan_list (struct server *serv, char *chan, char *users, char *topic) {}
 void fe_chan_list_end (struct server *serv) {}
 void fe_open_chan_list (server *serv, char *filter, int do_refresh)
-{
-	serv->p_list_channels (serv, filter, 1);
-}
+	{ serv->p_list_channels (serv, filter, 1); }
 
-/* --- Ban list --- */
 gboolean fe_add_ban_list (struct session *sess, char *mask, char *who,
-                          char *when, int rplcode) { return 0; }
+	char *when, int rplcode) { return 0; }
 gboolean fe_ban_list_end (struct session *sess, int rplcode) { return 0; }
 
-/* --- DCC (Phase 4) --- */
 void fe_dcc_add (struct DCC *dcc) {}
 void fe_dcc_update (struct DCC *dcc) {}
 void fe_dcc_remove (struct DCC *dcc) {}
@@ -1672,13 +1605,11 @@ int  fe_dcc_open_recv_win (int passive) { return FALSE; }
 int  fe_dcc_open_send_win (int passive) { return FALSE; }
 int  fe_dcc_open_chat_win (int passive) { return FALSE; }
 void fe_dcc_send_filereq (struct session *sess, char *nick, int maxcps,
-                          int passive) {}
+	int passive) {}
 
-/* --- Notifications / buddy list --- */
 void fe_notify_update (char *name) {}
 void fe_notify_ask (char *name, char *networks) {}
 
-/* --- Various UI updates --- */
 void fe_set_tab_color (struct session *sess, tabcolor col) {}
 void fe_update_mode_buttons (struct session *sess, char mode, char sign) {}
 void fe_update_channel_key (struct session *sess) {}
@@ -1694,36 +1625,21 @@ void fe_set_away (server *serv) {}
 void fe_serverlist_open (session *sess) {}
 void fe_add_rawlog (struct server *serv, char *text, int len, int outbound) {}
 
-/* --- Session/server lifecycle callbacks --- */
 void fe_session_callback (struct session *sess) {}
 void fe_server_callback (struct server *serv) {}
-
-/* --- URL grabber --- */
 void fe_url_add (const char *text) {}
-
-/* --- Plugin/button updates --- */
 void fe_pluginlist_update (void) {}
 void fe_buttons_update (struct session *sess) {}
 void fe_dlgbuttons_update (struct session *sess) {}
-
-/* --- Log search --- */
 void fe_lastlog (session *sess, session *lastlog_sess, char *sstr,
-                 gtk_xtext_search_flags flags) {}
-
-/* --- Menus (Phase 6) --- */
+	gtk_xtext_search_flags flags) {}
 char *fe_menu_add (menu_entry *me) { return NULL; }
 void  fe_menu_del (menu_entry *me) {}
 void  fe_menu_update (menu_entry *me) {}
-
-/* --- System tray (Phase 6) --- */
 void fe_tray_set_flash (const char *filename1, const char *filename2,
-                        int timeout) {}
+	int timeout) {}
 void fe_tray_set_file (const char *filename) {}
 void fe_tray_set_icon (feicon icon) {}
 void fe_tray_set_tooltip (const char *text) {}
-
-/* --- Nick change (not in fe.h but needed by the linker) --- */
 void fe_change_nick (struct server *serv, char *nick, char *newnick) {}
-
-/* --- Userlist hide (not in fe.h but needed by the linker) --- */
 void fe_userlist_hide (session *sess) {}

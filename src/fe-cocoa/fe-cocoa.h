@@ -18,23 +18,11 @@
 
 /*
  * ==========================================================================
- *  OBJECTIVE-C LESSON: Why is this header pure C?
- * ==========================================================================
+ *  Why is this header pure C?
  *
  *  This header gets #included by files in src/common/ — which are plain C.
  *  Plain C doesn't understand Objective-C types like NSWindow* or NSTextView*.
- *
- *  So we use "void *" (a generic pointer, just like in C) to represent
- *  Cocoa objects here. In our .m file (Objective-C), we'll cast them back:
- *
- *      NSWindow *window = (__bridge NSWindow *)sess->gui->window;
- *
- *  This is a common pattern when mixing C and Objective-C in the same project.
- *
- *  Files that end in:
- *    .c   = plain C           (no Objective-C allowed)
- *    .m   = Objective-C       (C + objects)  <-- we use this
- *    .mm  = Objective-C++     (C++ + objects)
+ *  So we use "void *" pointers here and cast them in the .m file.
  * ==========================================================================
  */
 
@@ -45,55 +33,58 @@
 
 /*
  * ==========================================================================
- *  DATA STRUCTURES — one per chat tab, one per server
+ *  PHASE 2 ARCHITECTURE — Single Window with Three Columns
  * ==========================================================================
  *
- *  HexChat's backend (src/common/) has two key structs:
+ *  +----------+---------------------------+---------+
+ *  | Server/  |                           | User    |
+ *  | Channel  |   Chat text area          | List    |
+ *  | Tree     |   (NSTextView — swaps     | (Table) |
+ *  |          |    content per session)    |         |
+ *  | libera   |                           | @op     |
+ *  |  #chan1  |                           | +voice  |
+ *  |  #chan2  |                           | nick1   |
+ *  +----------+---------------------------+---------+
+ *  | [input field                                 ] |
+ *  +------------------------------------------------+
  *
- *    struct session  — represents one chat tab (a channel, query, or server tab)
- *    struct server   — represents one IRC server connection
+ *  Key design:
+ *  - ONE main window (global, shared by all sessions)
+ *  - Each session has its OWN NSTextStorage (text buffer)
+ *  - When you click a channel in the tree, we swap which
+ *    NSTextStorage the text view displays
+ *  - Each session has its OWN NSMutableArray of user nicks
+ *  - When switching sessions, the user list table reloads
  *
- *  Each of these has a "gui" pointer that points to OUR frontend data.
- *  The backend never looks inside — it just passes it back to us.
- *
- *  In the GTK frontend, session_gui has ~30 GtkWidget pointers.
- *  For now, we keep it simple: just the essentials to get text on screen.
+ *  The global widgets (window, text view, split view, etc.) are NOT
+ *  stored in session_gui — they live as globals in fe-cocoa.m.
+ *  session_gui only stores per-session data.
  * ==========================================================================
  */
 
 /*
- * Per-tab GUI state. One of these exists for every open chat tab/window.
+ * Per-session GUI state. Each open channel/query/server tab has one.
  *
- * The "void *" fields will actually hold Objective-C objects:
- *   - void *window      ->  NSWindow *       (the macOS window)
- *   - void *text_view   ->  NSTextView *     (the big scrollable text area)
- *   - void *input_field ->  NSTextField *    (the one-line input box at bottom)
- *   - void *user_list   ->  NSTableView *   (the user list on the right side)
- *   - void *topic_bar   ->  NSTextField *    (shows channel topic at top)
+ * void * fields hold Objective-C objects:
+ *   text_storage   -> NSTextStorage * (this session's chat text buffer)
+ *   user_list_data -> NSMutableArray<NSString *> * (nick list for this session)
  */
 typedef struct session_gui
 {
-	void *window;         /* NSWindow     — the macOS window for this tab     */
-	void *text_view;      /* NSTextView   — where IRC messages appear         */
-	void *scroll_view;    /* NSScrollView — wraps text_view for scrolling     */
-	void *input_field;    /* NSTextField  — where user types commands/messages */
-	void *user_list;      /* NSTableView  — nick list on the right (future)   */
-	void *topic_bar;      /* NSTextField  — channel topic at top (future)     */
-	void *nick_label;     /* NSTextField  — shows your current nick (future)  */
+	void *text_storage;    /* NSTextStorage — this session's text buffer       */
+	void *user_list_data;  /* NSMutableArray — nicks in this channel           */
 
-	/* Non-Cocoa fields: */
-	char *input_text;     /* saved input text when this tab isn't focused     */
-	char *topic_text;     /* saved topic text when this tab isn't focused     */
+	char *input_text;      /* saved input text when this tab isn't focused     */
+	char *topic_text;      /* saved topic text                                 */
 
 } session_gui;
 
 /*
- * Per-server GUI state. One of these exists for every IRC server connection.
- * Mostly empty for now — we'll add rawlog window etc. later.
+ * Per-server GUI state.
  */
 typedef struct server_gui
 {
-	void *rawlog_window;  /* NSWindow  — raw IRC protocol viewer (future)     */
+	void *rawlog_window;   /* NSWindow — raw IRC protocol viewer (future)      */
 
 } server_gui;
 
