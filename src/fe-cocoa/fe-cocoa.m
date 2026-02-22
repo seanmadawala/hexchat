@@ -584,17 +584,22 @@ create_main_window (void)
 	[splitView addSubview:chatScrollView];
 	[splitView addSubview:userListScroll];
 
+	[content addSubview:splitView];
+
 	/*
 	 * Set initial divider positions.
 	 *
 	 * setPosition:ofDividerAtIndex: sets where a divider sits.
 	 * Divider 0 = between pane 0 and pane 1 (tree | chat)
 	 * Divider 1 = between pane 1 and pane 2 (chat | users)
+	 *
+	 * IMPORTANT: We call adjustSubviews first, then set positions
+	 * AFTER adding the split view to the window. This ensures
+	 * the split view knows its own size and can lay out properly.
 	 */
+	[splitView adjustSubviews];
 	[splitView setPosition:180 ofDividerAtIndex:0];
 	[splitView setPosition:(bounds.size.width - 150) ofDividerAtIndex:1];
-
-	[content addSubview:splitView];
 
 	/* Show the window. */
 	[mainWindow makeKeyAndOrderFront:nil];
@@ -1074,10 +1079,18 @@ fe_new_window (struct session *sess, int focus)
 		/* Refresh the channel tree to include this new session. */
 		refresh_channel_tree ();
 
-		/* If this should be focused, switch to it. */
+		/*
+		 * If this should be focused (or it's the first session), switch.
+		 *
+		 * BUG FIX: Do NOT set current_sess before calling switch_to_session!
+		 * switch_to_session() has an early-return check:
+		 *   if (sess == current_sess) return;
+		 * Setting current_sess first made it skip all the setup —
+		 * the text storage was never connected to the text view,
+		 * so text went into the buffer but was invisible.
+		 */
 		if (focus || !current_sess)
 		{
-			current_sess = sess;
 			switch_to_session (sess);
 		}
 	}
