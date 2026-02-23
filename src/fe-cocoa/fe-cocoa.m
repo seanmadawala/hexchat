@@ -213,14 +213,14 @@ static NSTableView   *editChanTable;
 static NSTableView   *editCmdTable;
 static NSTextField   *editNickField;
 static NSTextField   *editNick2Field;
-static NSTextField   *editRealField;
+static NSTextField   *editNick3Field;      /* Third choice (global only)      */
 static NSTextField   *editUserField;
 static NSSecureTextField *editPassField;
 static NSPopUpButton *editLoginPopup;
 static NSComboBox    *editCharsetCombo;
 static NSButton      *editChkGlobal;       /* "Use global user information"   */
-/* Fields that get grayed when "Use global" is checked. */
-static NSTextField   *editFieldsToToggle[4]; /* nick, nick2, real, user       */
+/* Fields that get toggled when "Use global" is checked. */
+static NSTextField   *editFieldsToToggle[4]; /* nick, nick2, nick3, user      */
 
 /* Login type mapping — must match the popup item order. */
 static const int cocoa_login_types_conf[] = {
@@ -2070,15 +2070,21 @@ show_edit_network (ircnet *net)
 		/* ==============================================================
 		 *  Text fields: nick, nick2, real, user, login, pass, charset
 		 * ============================================================== */
+		/*
+		 * When "Use global user information" is ON, show the global
+		 * prefs values (linked to the Network List fields).
+		 * When OFF, show per-network overrides.
+		 */
+		BOOL useGlobal = !!(net->flags & FLAG_USE_GLOBAL);
 		struct {
 			const char *label;
 			const char *value;
 			int secure;     /* 1 = password field */
 		} fields[] = {
-			{ "Nick name:",     net->nick,  0 },
-			{ "Second choice:", net->nick2, 0 },
-			{ "Real name:",     net->real,  0 },
-			{ "User name:",     net->user,  0 },
+			{ "Nick name:",     useGlobal ? prefs.hex_irc_nick1     : net->nick,  0 },
+			{ "Second choice:", useGlobal ? prefs.hex_irc_nick2     : net->nick2, 0 },
+			{ "Third choice:",  useGlobal ? prefs.hex_irc_nick3     : NULL,       0 },
+			{ "User name:",     useGlobal ? prefs.hex_irc_user_name : net->user,  0 },
 		};
 
 		y -= 8;
@@ -2107,11 +2113,11 @@ show_edit_network (ircnet *net)
 		}
 		editNickField  = textFields[0];
 		editNick2Field = textFields[1];
-		editRealField  = textFields[2];
+		editNick3Field = textFields[2];
 		editUserField  = textFields[3];
 		editFieldsToToggle[0] = editNickField;
 		editFieldsToToggle[1] = editNick2Field;
-		editFieldsToToggle[2] = editRealField;
+		editFieldsToToggle[2] = editNick3Field;
 		editFieldsToToggle[3] = editUserField;
 
 		/* Login method popup. */
@@ -2222,24 +2228,114 @@ show_edit_network (ircnet *net)
 static void
 edit_toggle_global_fields (void)
 {
-	if (!editChkGlobal) return;
+	if (!editChkGlobal || !editNet) return;
 	BOOL global = ([editChkGlobal state] == NSControlStateValueOn);
-	for (int i = 0; i < 4; i++)
+
+	/*
+	 * Swap displayed values: when global is ON, show prefs values
+	 * (linked to Network List); when OFF, show per-network values.
+	 * Also read the Network List text fields if they're open, since
+	 * the user may have edited them without saving yet.
+	 */
+	if (global)
 	{
-		[editFieldsToToggle[i] setEditable:!global];
-		[editFieldsToToggle[i] setEnabled:!global];
+		/* Read from NL fields if open, otherwise from prefs. */
+		NSString *n1 = slNickField1
+			? [slNickField1 stringValue]
+			: [NSString stringWithUTF8String:prefs.hex_irc_nick1];
+		NSString *n2 = slNickField2
+			? [slNickField2 stringValue]
+			: [NSString stringWithUTF8String:prefs.hex_irc_nick2];
+		NSString *n3 = slNickField3
+			? [slNickField3 stringValue]
+			: [NSString stringWithUTF8String:prefs.hex_irc_nick3];
+		NSString *u  = slUserField
+			? [slUserField stringValue]
+			: [NSString stringWithUTF8String:prefs.hex_irc_user_name];
+		[editNickField  setStringValue:n1 ?: @""];
+		[editNick2Field setStringValue:n2 ?: @""];
+		[editNick3Field setStringValue:n3 ?: @""];
+		[editUserField  setStringValue:u  ?: @""];
 	}
+	else
+	{
+		/* Show per-network values. */
+		NSString *n = editNet->nick
+			? [NSString stringWithUTF8String:editNet->nick] : @"";
+		NSString *n2 = editNet->nick2
+			? [NSString stringWithUTF8String:editNet->nick2] : @"";
+		NSString *u = editNet->user
+			? [NSString stringWithUTF8String:editNet->user] : @"";
+		[editNickField  setStringValue:n  ?: @""];
+		[editNick2Field setStringValue:n2 ?: @""];
+		[editNick3Field setStringValue:@""];  /* no per-network 3rd nick */
+		[editUserField  setStringValue:u  ?: @""];
+	}
+
+	/* The "Third choice" field only makes sense in global mode. */
+	[editNick3Field setEditable:global];
+	[editNick3Field setEnabled:global];
+
+	/* The other fields are only editable in per-network mode. */
+	[editNickField  setEditable:!global];
+	[editNickField  setEnabled:!global || YES];  /* visible but read-only when global */
+	[editNick2Field setEditable:!global];
+	[editUserField  setEditable:!global];
+
+	/* Actually: when global is ON, make all 4 fields editable so the
+	   user can change the global values from here too. */
+	/* All fields always enabled, just reflect the right source. */
+	[editNickField  setEditable:YES];
+	[editNickField  setEnabled:YES];
+	[editNick2Field setEditable:YES];
+	[editNick2Field setEnabled:YES];
+	[editNick3Field setEditable:global];
+	[editNick3Field setEnabled:global];
+	[editUserField  setEditable:YES];
+	[editUserField  setEnabled:YES];
 }
 
-/* ---------- Save fields back to ircnet ---------- */
+/* ---------- Save fields back to ircnet / prefs ---------- */
 static void
 edit_save_fields (void)
 {
 	if (!editNet) return;
 
-	/* Nick/user/real/pass — only save if "Use global" is off. */
-	if (!([editChkGlobal state] == NSControlStateValueOn))
+	BOOL global = editChkGlobal &&
+		([editChkGlobal state] == NSControlStateValueOn);
+
+	if (global)
 	{
+		/* Save nick/user back to global prefs AND sync to NL fields. */
+		const char *v;
+
+		v = [[editNickField stringValue] UTF8String];
+		if (v) safe_strcpy (prefs.hex_irc_nick1, v,
+			sizeof (prefs.hex_irc_nick1));
+		if (slNickField1) [slNickField1 setStringValue:
+			[editNickField stringValue]];
+
+		v = [[editNick2Field stringValue] UTF8String];
+		if (v) safe_strcpy (prefs.hex_irc_nick2, v,
+			sizeof (prefs.hex_irc_nick2));
+		if (slNickField2) [slNickField2 setStringValue:
+			[editNick2Field stringValue]];
+
+		v = [[editNick3Field stringValue] UTF8String];
+		if (v) safe_strcpy (prefs.hex_irc_nick3, v,
+			sizeof (prefs.hex_irc_nick3));
+		if (slNickField3) [slNickField3 setStringValue:
+			[editNick3Field stringValue]];
+
+		v = [[editUserField stringValue] UTF8String];
+		if (v) safe_strcpy (prefs.hex_irc_user_name, v,
+			sizeof (prefs.hex_irc_user_name));
+		if (slUserField) [slUserField setStringValue:
+			[editUserField stringValue]];
+	}
+	else
+	{
+		/* Save to per-network fields. */
 		const char *v;
 
 		v = [[editNickField stringValue] UTF8String];
@@ -2250,9 +2346,7 @@ edit_save_fields (void)
 		g_free (editNet->nick2);
 		editNet->nick2 = (v && v[0]) ? g_strdup (v) : NULL;
 
-		v = [[editRealField stringValue] UTF8String];
-		g_free (editNet->real);
-		editNet->real = (v && v[0]) ? g_strdup (v) : NULL;
+		/* Third choice not used in per-network mode. */
 
 		v = [[editUserField stringValue] UTF8String];
 		g_free (editNet->user);
@@ -2285,7 +2379,7 @@ edit_save_fields (void)
 	editNetWindow = nil;
 	editNet = nil;
 	editServerTable = editChanTable = editCmdTable = nil;
-	editNickField = editNick2Field = editRealField = editUserField = nil;
+	editNickField = editNick2Field = editNick3Field = editUserField = nil;
 	editPassField = nil;
 	editLoginPopup = nil;
 	editCharsetCombo = nil;
