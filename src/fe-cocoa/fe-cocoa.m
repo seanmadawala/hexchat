@@ -1,4 +1,4 @@
-/* HexChat — Cocoa Frontend (Phase 2)
+/* HexChat — Cocoa Frontend (Phase 3)
  * Copyright (C) 2026 Sean Madawala.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -9,32 +9,30 @@
 
 /*
  * ==========================================================================
- *  PHASE 2: Single window with server/channel tree + user list
+ *  PHASE 3: Six Feature Sprint
  *
- *  New Cocoa concepts introduced in this phase:
+ *  Feature 1 — mIRC Color Rendering
+ *    Parse \003NN,NN color codes, \002 bold, \035 italic, \037 underline,
+ *    \036 strikethrough, \026 reverse, \017 reset. Renders colored text
+ *    using NSAttributedString with a 16-color mIRC palette.
  *
- *  NSOutlineView — A hierarchical (tree) table view. Like NSTableView
- *    but rows can have children (expandable with disclosure triangles).
- *    Perfect for: server → channel1, channel2, ...
+ *  Feature 2 — User Mode Badges + User Count Label
+ *    Colored circles (Unicode ●) next to nicks based on prefix:
+ *      ~ owner=purple, & admin=red, @ op=green, % hop=blue, + voice=yellow.
+ *    Summary label above user list: "7 ops, 531 total".
  *
- *  NSSplitView — A view that divides space into resizable panes.
- *    Like having movable dividers between panels. The user can drag
- *    the dividers to resize the tree, chat, and user list columns.
+ *  Feature 3 — Topic Bar
+ *    Read-only text field above the chat area showing channel topic.
  *
- *  NSTextStorage — The "model" (data) behind an NSTextView. Think of
- *    it as a mutable attributed string that can be swapped in and out.
- *    Each session has its own NSTextStorage. When you click a channel
- *    in the tree, we tell the layout manager to use that session's
- *    text storage, and the text view instantly shows different content.
+ *  Feature 4 — Nick Tab-Completion
+ *    Press Tab to complete nicknames. Subsequent Tab presses cycle matches.
  *
- *  Data Source pattern — NSOutlineView and NSTableView don't store
- *    data themselves. Instead, they ask a "data source" object:
- *    "how many rows?" "what's in row 3?" This is like a callback
- *    system but object-oriented. We implement data source protocols.
+ *  Feature 5 — Server List Dialog
+ *    Window listing saved networks from HexChat's servlist. Connect button.
  *
- *  Delegate pattern — Objects that handle events on behalf of others.
- *    NSOutlineViewDelegate handles "user clicked a row".
- *    NSTextFieldDelegate handles "user pressed Enter".
+ *  Feature 6 — DCC Transfers Panel
+ *    Window with table showing file transfers: nick, file, size, progress,
+ *    speed, status.
  * ==========================================================================
  */
 
@@ -56,15 +54,14 @@
 #include "../common/outbound.h"
 #include "../common/util.h"
 #include "../common/fe.h"
+#include "../common/servlist.h"
+#include "../common/userlist.h"
 
 #include "fe-cocoa.h"
 
 
 /* ==========================================================================
  *  FORWARD DECLARATIONS
- *
- *  We declare classes and functions here so they can reference each other.
- *  The full @implementation blocks come later in the file.
  * ==========================================================================
  */
 
@@ -72,7 +69,10 @@ static void create_main_window (void);
 static void create_menu_bar (void);
 static void switch_to_session (struct session *sess);
 static void refresh_channel_tree (void);
-static void refresh_user_list (void);
+static void update_user_count_label (void);
+static void init_mirc_colors (void);
+static void show_server_list (void);
+static void show_dcc_panel (void);
 
 /* Helper: get the NSTextStorage for a session. */
 static inline NSTextStorage *
@@ -96,24 +96,12 @@ get_user_list_data (struct session *sess)
 /* ==========================================================================
  *  DATA MODEL — Wrapper objects for the channel tree
  * ==========================================================================
- *
- *  NSOutlineView needs Objective-C objects as "items" in the tree.
- *  We can't pass raw C pointers (struct server *, struct session *)
- *  directly because NSOutlineView retains items and compares them
- *  by object identity.
- *
- *  HCServerNode wraps a server — it's a top-level row in the tree.
- *  HCSessionNode wraps a session — it's a child row under a server.
- *
- *  We maintain a global NSMutableArray of HCServerNode objects.
- *  Each HCServerNode has an NSMutableArray of HCSessionNode children.
- * ==========================================================================
  */
 
 @interface HCServerNode : NSObject
-@property (assign, nonatomic) struct server *server;    /* C pointer, not retained */
-@property (strong, nonatomic) NSString *name;           /* Display name */
-@property (strong, nonatomic) NSMutableArray *children;  /* HCSessionNode objects */
+@property (assign, nonatomic) struct server *server;
+@property (strong, nonatomic) NSString *name;
+@property (strong, nonatomic) NSMutableArray *children;
 @end
 
 @implementation HCServerNode
@@ -154,32 +142,203 @@ get_user_list_data (struct session *sess)
 
 
 /* ==========================================================================
- *  GLOBAL STATE — The single main window and its subviews
+ *  GLOBAL STATE
  * ==========================================================================
  */
 
 static int done = FALSE;
 static int done_intro = 0;
 
-/* --- The one main window and its components --- */
-static NSWindow      *mainWindow;       /* The single app window               */
-static NSSplitView   *splitView;        /* 3-pane: tree | chat | users         */
-static NSOutlineView *channelTree;      /* Left: server/channel tree           */
-static NSScrollView  *channelTreeScroll;/* Wraps the outline view              */
-static NSTextView    *chatTextView;     /* Center: chat text display           */
-static NSScrollView  *chatScrollView;   /* Wraps the text view                 */
-static NSTableView   *userListTable;    /* Right: user nick list               */
-static NSScrollView  *userListScroll;   /* Wraps the table view                */
-static NSTextField   *inputField;       /* Bottom: text input                  */
+/* --- Main window and components --- */
+static NSWindow      *mainWindow;
+static NSSplitView   *splitView;
+static NSOutlineView *channelTree;
+static NSScrollView  *channelTreeScroll;
+static NSTextView    *chatTextView;
+static NSScrollView  *chatScrollView;
+static NSTableView   *userListTable;
+static NSScrollView  *userListScroll;
+static NSTextField   *inputField;
 
-/* --- Data model for the channel tree --- */
-static NSMutableArray *serverNodes;     /* Array of HCServerNode               */
+/* --- Phase 3 new widgets --- */
+static NSTextField   *topicBar;           /* Feature 3: topic display          */
+static NSTextField   *userCountLabel;     /* Feature 2: "7 ops, 531 total"    */
+static NSView        *centerWrapper;      /* Holds topic bar + chat scroll     */
+static NSView        *rightWrapper;       /* Holds user count + user scroll    */
+
+/* --- Data model for channel tree --- */
+static NSMutableArray *serverNodes;
 
 /* --- Delegates (prevent deallocation) --- */
 static id appDelegate;
 static id inputDelegate;
-static id treeDataSource;              /* Also serves as delegate              */
-static id userListDataSource;          /* Also serves as delegate              */
+static id treeDataSource;
+static id userListDataSource;
+
+/* --- Feature 1: mIRC color palette (16 colors) --- */
+static NSColor *mircColors[16];
+
+/*
+ * COCOA LESSON: NSColor
+ *
+ * NSColor represents a color in Cocoa. We create colors from
+ * RGB float values (0.0 to 1.0). The mIRC protocol defines 16
+ * standard colors indexed 0-15. When text contains \003NN, we
+ * look up mircColors[NN] to get the corresponding NSColor.
+ */
+
+/* --- Feature 4: Tab-completion state --- */
+static NSMutableArray *completionMatches;  /* Current list of matching nicks  */
+static NSString       *completionPrefix;   /* The partial word being completed */
+static NSInteger       completionIndex;    /* Which match we're showing       */
+static NSInteger       completionStart;    /* Character position of the word  */
+
+/* --- Feature 5: Server List panel --- */
+static NSWindow      *serverListWindow;
+static NSTableView   *serverListTable;
+static NSMutableArray *serverListNets;     /* Array of ircnet * (wrapped)     */
+static id             serverListDataSource;
+
+/* --- Feature 6: DCC panel --- */
+static NSWindow      *dccWindow;
+static NSTableView   *dccTable;
+static NSMutableArray *dccTransfers;       /* Array of struct DCC * (wrapped) */
+static id             dccDataSource;
+
+
+/* ==========================================================================
+ *  FEATURE 1 — mIRC Color Palette Initialization
+ * ==========================================================================
+ *
+ *  These 16 colors match the GTK frontend's palette.c values.
+ *  GdkColor uses 16-bit values (0x0000–0xFFFF). We convert to
+ *  NSColor floats (0.0–1.0) by dividing by 65535.0.
+ */
+
+static void
+init_mirc_colors (void)
+{
+	mircColors[ 0] = [NSColor colorWithSRGBRed:0.827 green:0.843 blue:0.812 alpha:1.0]; /* white    */
+	mircColors[ 1] = [NSColor colorWithSRGBRed:0.180 green:0.204 blue:0.212 alpha:1.0]; /* black    */
+	mircColors[ 2] = [NSColor colorWithSRGBRed:0.204 green:0.396 blue:0.643 alpha:1.0]; /* blue     */
+	mircColors[ 3] = [NSColor colorWithSRGBRed:0.306 green:0.604 blue:0.024 alpha:1.0]; /* green    */
+	mircColors[ 4] = [NSColor colorWithSRGBRed:0.800 green:0.000 blue:0.000 alpha:1.0]; /* red      */
+	mircColors[ 5] = [NSColor colorWithSRGBRed:0.561 green:0.224 blue:0.008 alpha:1.0]; /* lt red   */
+	mircColors[ 6] = [NSColor colorWithSRGBRed:0.361 green:0.208 blue:0.400 alpha:1.0]; /* purple   */
+	mircColors[ 7] = [NSColor colorWithSRGBRed:0.808 green:0.361 blue:0.000 alpha:1.0]; /* orange   */
+	mircColors[ 8] = [NSColor colorWithSRGBRed:0.769 green:0.627 blue:0.000 alpha:1.0]; /* yellow   */
+	mircColors[ 9] = [NSColor colorWithSRGBRed:0.451 green:0.824 blue:0.086 alpha:1.0]; /* lt green */
+	mircColors[10] = [NSColor colorWithSRGBRed:0.067 green:0.659 blue:0.475 alpha:1.0]; /* aqua     */
+	mircColors[11] = [NSColor colorWithSRGBRed:0.345 green:0.631 blue:0.616 alpha:1.0]; /* lt aqua  */
+	mircColors[12] = [NSColor colorWithSRGBRed:0.341 green:0.475 blue:0.620 alpha:1.0]; /* lt blue  */
+	mircColors[13] = [NSColor colorWithSRGBRed:0.629 green:0.824 blue:0.396 alpha:1.0]; /* lt purple*/
+	mircColors[14] = [NSColor colorWithSRGBRed:0.333 green:0.341 blue:0.325 alpha:1.0]; /* grey     */
+	mircColors[15] = [NSColor colorWithSRGBRed:0.533 green:0.541 blue:0.522 alpha:1.0]; /* lt grey  */
+}
+
+
+/* ==========================================================================
+ *  FEATURE 2 — Badge Color for User Prefixes
+ * ==========================================================================
+ *
+ *  Maps an IRC user prefix character to a colored circle indicator.
+ *  Returns nil for users with no prefix (regular users).
+ */
+
+static NSColor *
+badge_color_for_prefix (char prefix)
+{
+	switch (prefix)
+	{
+	case '~': return [NSColor purpleColor];                                   /* owner   */
+	case '&': return [NSColor redColor];                                      /* admin   */
+	case '@': return [NSColor colorWithSRGBRed:0.2 green:0.8 blue:0.2 alpha:1.0]; /* op */
+	case '%': return [NSColor colorWithSRGBRed:0.3 green:0.5 blue:1.0 alpha:1.0]; /* hop */
+	case '+': return [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.0 alpha:1.0]; /* voice */
+	default:  return nil;
+	}
+}
+
+/*
+ * Build an NSAttributedString for a user list entry.
+ * If the user has a prefix (@ + % etc.), prepend a colored ● circle.
+ */
+static NSAttributedString *
+make_user_list_entry (char prefix, const char *nick)
+{
+	@autoreleasepool
+	{
+		NSMutableAttributedString *result = [[NSMutableAttributedString alloc] init];
+		NSFont *font = [NSFont systemFontOfSize:12];
+
+		NSColor *badgeColor = badge_color_for_prefix (prefix);
+		if (badgeColor)
+		{
+			/* Colored circle ● followed by a space. */
+			NSDictionary *badgeAttrs = @{
+				NSForegroundColorAttributeName: badgeColor,
+				NSFontAttributeName: font,
+			};
+			[result appendAttributedString:
+				[[NSAttributedString alloc]
+					initWithString:@"\xE2\x97\x8F " attributes:badgeAttrs]];
+		}
+		else
+		{
+			/* No prefix — add spacing to align with badged nicks. */
+			NSDictionary *spaceAttrs = @{
+				NSForegroundColorAttributeName: [NSColor clearColor],
+				NSFontAttributeName: font,
+			};
+			[result appendAttributedString:
+				[[NSAttributedString alloc]
+					initWithString:@"\xE2\x97\x8F " attributes:spaceAttrs]];
+		}
+
+		/* The nick itself. */
+		NSString *nsNick = [NSString stringWithUTF8String:nick];
+		if (!nsNick) nsNick = @"???";
+		NSDictionary *nickAttrs = @{
+			NSForegroundColorAttributeName:
+				[NSColor labelColor],
+			NSFontAttributeName: font,
+		};
+		[result appendAttributedString:
+			[[NSAttributedString alloc]
+				initWithString:nsNick attributes:nickAttrs]];
+
+		return result;
+	}
+}
+
+/* Update the "7 ops, 531 total" label above the user list. */
+static void
+update_user_count_label (void)
+{
+	if (!userCountLabel || !current_sess)
+		return;
+
+	NSMutableArray *users = get_user_list_data (current_sess);
+	NSInteger total = users ? (NSInteger)[users count] : 0;
+
+	/* Count ops by walking the session's actual user tree. */
+	NSInteger ops = 0;
+	if (current_sess->usertree)
+	{
+		GList *list = userlist_double_list (current_sess);
+		for (GList *iter = list; iter; iter = iter->next)
+		{
+			struct User *u = iter->data;
+			if (u && u->op)
+				ops++;
+		}
+		g_list_free (list);
+	}
+
+	NSString *text = [NSString stringWithFormat:@"%ld ops, %ld total",
+		(long)ops, (long)total];
+	[userCountLabel setStringValue:text];
+}
 
 
 /* ==========================================================================
@@ -201,7 +360,7 @@ static id userListDataSource;          /* Also serves as delegate              *
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
 {
-	return YES;  /* Quit when the window closes. */
+	return YES;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
@@ -222,7 +381,7 @@ static id userListDataSource;          /* Also serves as delegate              *
 
 
 /* ==========================================================================
- *  HCInputDelegate — Handles Enter key in the input field
+ *  HCInputDelegate — Handles Enter and Tab in the input field
  * ==========================================================================
  */
 
@@ -235,6 +394,7 @@ static id userListDataSource;          /* Also serves as delegate              *
 	   textView:(NSTextView *)textView
 doCommandBySelector:(SEL)commandSelector
 {
+	/* --- Enter key: send message --- */
 	if (commandSelector == @selector(insertNewline:))
 	{
 		NSTextField *field = (NSTextField *)control;
@@ -245,9 +405,125 @@ doCommandBySelector:(SEL)commandSelector
 			handle_multiline (current_sess, (char *)text, TRUE, FALSE);
 			[field setStringValue:@""];
 		}
+
+		/* Reset tab-completion state on Enter. */
+		completionMatches = nil;
+		completionPrefix = nil;
+		completionIndex = 0;
+
 		return YES;
 	}
+
+	/*
+	 * FEATURE 4 — Tab key: nick completion.
+	 *
+	 * COCOA LESSON: insertTab:
+	 *
+	 * When the user presses Tab in an NSTextField, Cocoa sends
+	 * insertTab: which normally moves focus to the next field.
+	 * We intercept it here to do IRC nick completion instead.
+	 *
+	 * Algorithm:
+	 * 1. If we have existing matches, cycle to the next one
+	 * 2. Otherwise, find the partial word before the cursor
+	 * 3. Walk the channel's user list for matching nicks
+	 * 4. Replace the partial word with the first match
+	 * 5. If at start of line, append ": " (IRC convention)
+	 */
+	if (commandSelector == @selector(insertTab:))
+	{
+		if (!current_sess) return YES;
+
+		NSTextField *field = (NSTextField *)control;
+		NSString *fullText = [field stringValue];
+
+		/* If we already have matches, cycle through them. */
+		if (completionMatches && [completionMatches count] > 0)
+		{
+			completionIndex = (completionIndex + 1) % [completionMatches count];
+			NSString *match = completionMatches[completionIndex];
+
+			/* Build the replacement string. */
+			NSString *suffix = (completionStart == 0) ? @": " : @" ";
+			NSString *before = [fullText substringToIndex:completionStart];
+
+			/* Find end of previous completion to replace it. */
+			NSString *newText = [NSString stringWithFormat:@"%@%@%@",
+				before, match, suffix];
+			[field setStringValue:newText];
+			return YES;
+		}
+
+		/* No existing matches — start a new completion. */
+		NSInteger cursorPos = (NSInteger)[fullText length];
+
+		/* Find the start of the word being completed. */
+		NSInteger wordStart = cursorPos;
+		while (wordStart > 0 &&
+			[fullText characterAtIndex:wordStart - 1] != ' ')
+		{
+			wordStart--;
+		}
+
+		if (wordStart == cursorPos)
+			return YES;  /* Nothing to complete. */
+
+		NSString *partial = [fullText substringWithRange:
+			NSMakeRange (wordStart, cursorPos - wordStart)];
+
+		/* Walk the user list for matches. */
+		NSMutableArray *matches = [[NSMutableArray alloc] init];
+		GList *list = userlist_double_list (current_sess);
+		for (GList *iter = list; iter; iter = iter->next)
+		{
+			struct User *u = iter->data;
+			if (!u) continue;
+			NSString *nick = [NSString stringWithUTF8String:u->nick];
+			if ([nick length] >= [partial length] &&
+				[[nick substringToIndex:[partial length]]
+					caseInsensitiveCompare:partial] == NSOrderedSame)
+			{
+				[matches addObject:nick];
+			}
+		}
+		g_list_free (list);
+
+		if ([matches count] == 0)
+			return YES;  /* No matches. */
+
+		/* Save completion state for cycling. */
+		completionMatches = matches;
+		completionPrefix = partial;
+		completionIndex = 0;
+		completionStart = wordStart;
+
+		/* Insert the first match. */
+		NSString *match = matches[0];
+		NSString *suffix = (wordStart == 0) ? @": " : @" ";
+		NSString *before = [fullText substringToIndex:wordStart];
+		NSString *newText = [NSString stringWithFormat:@"%@%@%@",
+			before, match, suffix];
+		[field setStringValue:newText];
+
+		return YES;
+	}
+
+	/* Any other key resets completion state. */
+	completionMatches = nil;
+	completionPrefix = nil;
+	completionIndex = 0;
+
 	return NO;
+}
+
+/*
+ * Reset tab completion when the user types anything new.
+ */
+- (void)controlTextDidChange:(NSNotification *)notification
+{
+	completionMatches = nil;
+	completionPrefix = nil;
+	completionIndex = 0;
 }
 
 @end
@@ -255,28 +531,6 @@ doCommandBySelector:(SEL)commandSelector
 
 /* ==========================================================================
  *  HCChannelTreeDataSource — Data source + delegate for the left sidebar
- * ==========================================================================
- *
- *  COCOA LESSON: NSOutlineViewDataSource protocol
- *
- *  NSOutlineView asks us these questions to build the tree:
- *
- *  1. "How many children does this item have?"
- *     - If item == nil, return number of top-level items (servers)
- *     - If item is a server node, return number of its sessions
- *
- *  2. "What is child number N of this item?"
- *     - Return the HCServerNode or HCSessionNode at that index
- *
- *  3. "Is this item expandable?" (can it have children?)
- *     - Servers are expandable, sessions are not
- *
- *  4. "What should I display for this item?"
- *     - Return the name string
- *
- *  NSOutlineViewDelegate handles:
- *  5. "The user clicked/selected a row — what should happen?"
- *     - We switch to that session
  * ==========================================================================
  */
 
@@ -286,87 +540,58 @@ doCommandBySelector:(SEL)commandSelector
 
 @implementation HCChannelTreeDataSource
 
-/* How many children does this item have? */
 - (NSInteger)outlineView:(NSOutlineView *)outlineView
 	numberOfChildrenOfItem:(id)item
 {
 	if (item == nil)
-		return (NSInteger)[serverNodes count];  /* Top-level: servers */
-
+		return (NSInteger)[serverNodes count];
 	if ([item isKindOfClass:[HCServerNode class]])
 		return (NSInteger)[((HCServerNode *)item).children count];
-
-	return 0;  /* Sessions have no children */
+	return 0;
 }
 
-/* Return child at index. */
 - (id)outlineView:(NSOutlineView *)outlineView
 	child:(NSInteger)index
 	ofItem:(id)item
 {
 	if (item == nil)
 		return serverNodes[index];
-
 	if ([item isKindOfClass:[HCServerNode class]])
 		return ((HCServerNode *)item).children[index];
-
 	return nil;
 }
 
-/* Is this item expandable? */
 - (BOOL)outlineView:(NSOutlineView *)outlineView
 	isItemExpandable:(id)item
 {
 	return [item isKindOfClass:[HCServerNode class]];
 }
 
-/*
- * What to display for this item?
- *
- * COCOA LESSON: NSTableColumn + objectValue
- *
- * NSOutlineView (and NSTableView) use "cell-based" or "view-based" mode.
- * In cell-based mode (simpler), each cell asks for an "objectValue" —
- * typically an NSString — and displays it as text.
- */
 - (id)outlineView:(NSOutlineView *)outlineView
 	objectValueForTableColumn:(NSTableColumn *)tableColumn
 	byItem:(id)item
 {
 	if ([item isKindOfClass:[HCServerNode class]])
 		return ((HCServerNode *)item).name;
-
 	if ([item isKindOfClass:[HCSessionNode class]])
 		return ((HCSessionNode *)item).name;
-
 	return @"???";
 }
 
-/*
- * User selected a row — switch to that session.
- *
- * COCOA LESSON: outlineViewSelectionDidChange:
- *
- * This delegate method is called AFTER the selection changes.
- * We figure out which item was selected and switch to it.
- */
 - (void)outlineViewSelectionDidChange:(NSNotification *)notification
 {
 	NSInteger row = [channelTree selectedRow];
-	if (row < 0)
-		return;
+	if (row < 0) return;
 
 	id item = [channelTree itemAtRow:row];
 
 	if ([item isKindOfClass:[HCSessionNode class]])
 	{
 		struct session *sess = ((HCSessionNode *)item).session;
-		if (sess)
-			switch_to_session (sess);
+		if (sess) switch_to_session (sess);
 	}
 	else if ([item isKindOfClass:[HCServerNode class]])
 	{
-		/* Clicked a server row — switch to the server session. */
 		struct server *serv = ((HCServerNode *)item).server;
 		if (serv && serv->server_session)
 			switch_to_session (serv->server_session);
@@ -377,12 +602,7 @@ doCommandBySelector:(SEL)commandSelector
 
 
 /* ==========================================================================
- *  HCUserListDataSource — Data source + delegate for the right sidebar
- * ==========================================================================
- *
- *  Much simpler than the tree — it's a flat list of nicks.
- *  We ask the current session's user_list_data (NSMutableArray) for
- *  the number of rows and the string at each row.
+ *  HCUserListDataSource — Feature 2: returns attributed strings with badges
  * ==========================================================================
  */
 
@@ -406,7 +626,116 @@ doCommandBySelector:(SEL)commandSelector
 	if (!users || row < 0 || row >= (NSInteger)[users count])
 		return @"";
 
+	/*
+	 * Each entry is an NSAttributedString with a colored ● badge.
+	 * Cell-based NSTableView renders attributed strings natively.
+	 */
 	return users[row];
+}
+
+@end
+
+
+/* ==========================================================================
+ *  FEATURE 5 — HCServerListDataSource
+ * ==========================================================================
+ */
+
+@interface HCServerListDataSource : NSObject
+	<NSTableViewDataSource, NSTableViewDelegate>
+@end
+
+@implementation HCServerListDataSource
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+	return serverListNets ? (NSInteger)[serverListNets count] : 0;
+}
+
+- (id)tableView:(NSTableView *)tableView
+	objectValueForTableColumn:(NSTableColumn *)tableColumn
+	row:(NSInteger)row
+{
+	if (!serverListNets || row < 0 || row >= (NSInteger)[serverListNets count])
+		return @"";
+
+	ircnet *net = [serverListNets[row] pointerValue];
+	if (!net || !net->name) return @"???";
+	return [NSString stringWithUTF8String:net->name];
+}
+
+@end
+
+
+/* ==========================================================================
+ *  FEATURE 6 — HCDCCDataSource
+ * ==========================================================================
+ */
+
+@interface HCDCCDataSource : NSObject
+	<NSTableViewDataSource, NSTableViewDelegate>
+@end
+
+@implementation HCDCCDataSource
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+	return dccTransfers ? (NSInteger)[dccTransfers count] : 0;
+}
+
+- (id)tableView:(NSTableView *)tableView
+	objectValueForTableColumn:(NSTableColumn *)tableColumn
+	row:(NSInteger)row
+{
+	if (!dccTransfers || row < 0 || row >= (NSInteger)[dccTransfers count])
+		return @"";
+
+	struct DCC *dcc = [dccTransfers[row] pointerValue];
+	if (!dcc) return @"";
+
+	NSString *ident = [tableColumn identifier];
+
+	if ([ident isEqualToString:@"nick"])
+		return dcc->nick ? [NSString stringWithUTF8String:dcc->nick] : @"";
+
+	if ([ident isEqualToString:@"file"])
+		return dcc->file ? [NSString stringWithUTF8String:dcc->file] : @"";
+
+	if ([ident isEqualToString:@"size"])
+	{
+		if (dcc->size < 1024)
+			return [NSString stringWithFormat:@"%llu B", dcc->size];
+		else if (dcc->size < 1048576)
+			return [NSString stringWithFormat:@"%.1f KB", dcc->size / 1024.0];
+		else
+			return [NSString stringWithFormat:@"%.1f MB", dcc->size / 1048576.0];
+	}
+
+	if ([ident isEqualToString:@"progress"])
+	{
+		if (dcc->size == 0) return @"0%";
+		double pct = (double)dcc->pos / (double)dcc->size * 100.0;
+		return [NSString stringWithFormat:@"%.1f%%", pct];
+	}
+
+	if ([ident isEqualToString:@"speed"])
+	{
+		if (dcc->cps < 1024)
+			return [NSString stringWithFormat:@"%lld B/s", (long long)dcc->cps];
+		else
+			return [NSString stringWithFormat:@"%.1f KB/s", dcc->cps / 1024.0];
+	}
+
+	if ([ident isEqualToString:@"status"])
+	{
+		const char *names[] = {"Queued","Active","Failed","Done","Connecting","Aborted"};
+		int idx = (int)dcc->dccstat;
+		if (idx >= 0 && idx <= 5)
+			return [NSString stringWithUTF8String:names[idx]];
+		return @"?";
+	}
+
+	return @"";
 }
 
 @end
@@ -438,17 +767,16 @@ create_main_window (void)
 	NSRect bounds = [content bounds];
 
 	/*
-	 * LAYOUT: We use a simple autoresizing approach.
+	 * LAYOUT (Phase 3):
 	 *
-	 * The NSSplitView fills the top portion (all except 30px for input).
-	 * The NSTextField sits at the bottom.
-	 *
-	 *   +------+------------------+------+
-	 *   | tree | chat scroll view | user |  <- NSSplitView (3 subviews)
-	 *   |      |                  | list |
-	 *   +------+------------------+------+
-	 *   | input field                    |  <- NSTextField (fixed height)
-	 *   +--------------------------------+
+	 *   +------+------------------+-----------+
+	 *   | tree | [topic bar     ] | N ops, M  |
+	 *   |      |                  | total     |
+	 *   |      | chat scroll view |-----------|
+	 *   |      |                  | user list |
+	 *   +------+------------------+-----------+
+	 *   | [input field                       ] |
+	 *   +--------------------------------------+
 	 */
 
 	/* --- Input field (bottom, 28px tall) --- */
@@ -464,22 +792,12 @@ create_main_window (void)
 	/* --- Split view (fills everything above input) --- */
 	NSRect splitFrame = NSMakeRect (0, 28, bounds.size.width,
 		bounds.size.height - 28);
-
-	/*
-	 * COCOA LESSON: NSSplitView
-	 *
-	 * NSSplitView arranges its subviews side by side (horizontal) or
-	 * stacked (vertical). isVertical=YES means columns (left-to-right).
-	 *
-	 * You add subviews in order: first = leftmost, last = rightmost.
-	 * The user can drag the dividers to resize columns.
-	 */
 	splitView = [[NSSplitView alloc] initWithFrame:splitFrame];
-	[splitView setVertical:YES];          /* Columns, not rows.               */
+	[splitView setVertical:YES];
 	[splitView setDividerStyle:NSSplitViewDividerStyleThin];
 	[splitView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
 
-	/* --- LEFT PANE: Channel tree (NSOutlineView in NSScrollView) --- */
+	/* --- LEFT PANE: Channel tree --- */
 	NSRect treeFrame = NSMakeRect (0, 0, 180, splitFrame.size.height);
 	channelTreeScroll = [[NSScrollView alloc] initWithFrame:treeFrame];
 	[channelTreeScroll setHasVerticalScroller:YES];
@@ -487,37 +805,46 @@ create_main_window (void)
 	[channelTreeScroll setAutoresizingMask:
 		(NSViewWidthSizable | NSViewHeightSizable)];
 
-	/*
-	 * COCOA LESSON: NSOutlineView
-	 *
-	 * NSOutlineView is a subclass of NSTableView that supports
-	 * hierarchical (tree) data. It shows disclosure triangles (▶/▼)
-	 * to expand/collapse parent rows.
-	 *
-	 * It needs at least one NSTableColumn to display text.
-	 * outlineTableColumn is the special column that shows the
-	 * disclosure triangles + indentation for child rows.
-	 */
 	channelTree = [[NSOutlineView alloc] initWithFrame:
 		[[channelTreeScroll contentView] bounds]];
-
 	NSTableColumn *treeCol = [[NSTableColumn alloc]
 		initWithIdentifier:@"channels"];
 	[treeCol setWidth:170];
 	[treeCol setTitle:@"Channels"];
 	[channelTree addTableColumn:treeCol];
 	[channelTree setOutlineTableColumn:treeCol];
-
-	/* Style: no header, source-list style (macOS sidebar look). */
 	[channelTree setHeaderView:nil];
-
 	[channelTree setDataSource:(id<NSOutlineViewDataSource>)treeDataSource];
 	[channelTree setDelegate:(id<NSOutlineViewDelegate>)treeDataSource];
-
 	[channelTreeScroll setDocumentView:channelTree];
 
-	/* --- CENTER PANE: Chat text view --- */
-	NSRect chatFrame = NSMakeRect (0, 0, 580, splitFrame.size.height);
+	/*
+	 * --- CENTER PANE: Topic bar + Chat text view ---
+	 *
+	 * FEATURE 3: We wrap the topic bar and chat scroll view
+	 * in an NSView so they appear as one pane in the split view.
+	 */
+	NSRect centerFrame = NSMakeRect (0, 0, 580, splitFrame.size.height);
+	centerWrapper = [[NSView alloc] initWithFrame:centerFrame];
+	[centerWrapper setAutoresizingMask:
+		(NSViewWidthSizable | NSViewHeightSizable)];
+
+	/* Topic bar (24px tall, at the top of the center pane). */
+	NSRect topicFrame = NSMakeRect (0, centerFrame.size.height - 24,
+		centerFrame.size.width, 24);
+	topicBar = [NSTextField labelWithString:@""];
+	[topicBar setFrame:topicFrame];
+	[topicBar setFont:[NSFont systemFontOfSize:11]];
+	[topicBar setTextColor:[NSColor secondaryLabelColor]];
+	[topicBar setBackgroundColor:[NSColor colorWithWhite:0.15 alpha:1.0]];
+	[topicBar setDrawsBackground:YES];
+	[topicBar setLineBreakMode:NSLineBreakByTruncatingTail];
+	[topicBar setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
+	[centerWrapper addSubview:topicBar];
+
+	/* Chat scroll view (fills below topic bar). */
+	NSRect chatFrame = NSMakeRect (0, 0, centerFrame.size.width,
+		centerFrame.size.height - 24);
 	chatScrollView = [[NSScrollView alloc] initWithFrame:chatFrame];
 	[chatScrollView setHasVerticalScroller:YES];
 	[chatScrollView setHasHorizontalScroller:NO];
@@ -535,71 +862,72 @@ create_main_window (void)
 		[NSColor colorWithWhite:0.1 alpha:1.0]];
 	[chatTextView setTextColor:
 		[NSColor colorWithWhite:0.9 alpha:1.0]];
-
-	/* Make text wrap to the view width. */
 	[chatTextView setMaxSize:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
 	[chatTextView setMinSize:NSMakeSize(0, chatFrame.size.height)];
 	[chatTextView setAutoresizingMask:NSViewWidthSizable];
 	[[chatTextView textContainer] setWidthTracksTextView:YES];
-
 	[chatScrollView setDocumentView:chatTextView];
 
-	/* --- RIGHT PANE: User list (NSTableView in NSScrollView) --- */
-	NSRect userFrame = NSMakeRect (0, 0, 140, splitFrame.size.height);
+	[centerWrapper addSubview:chatScrollView];
+
+	/*
+	 * --- RIGHT PANE: User count label + User list ---
+	 *
+	 * FEATURE 2: Wrapper holds the count label at top and
+	 * the user list scroll view below it.
+	 */
+	NSRect rightFrame = NSMakeRect (0, 0, 150, splitFrame.size.height);
+	rightWrapper = [[NSView alloc] initWithFrame:rightFrame];
+	[rightWrapper setAutoresizingMask:
+		(NSViewWidthSizable | NSViewHeightSizable)];
+
+	/* User count label (20px tall, at top). */
+	NSRect countFrame = NSMakeRect (0, rightFrame.size.height - 20,
+		rightFrame.size.width, 20);
+	userCountLabel = [NSTextField labelWithString:@"0 ops, 0 total"];
+	[userCountLabel setFrame:countFrame];
+	[userCountLabel setFont:[NSFont systemFontOfSize:10]];
+	[userCountLabel setTextColor:[NSColor secondaryLabelColor]];
+	[userCountLabel setAlignment:NSTextAlignmentCenter];
+	[userCountLabel setAutoresizingMask:
+		(NSViewWidthSizable | NSViewMinYMargin)];
+	[rightWrapper addSubview:userCountLabel];
+
+	/* User list scroll view (below the count label). */
+	NSRect userFrame = NSMakeRect (0, 0, rightFrame.size.width,
+		rightFrame.size.height - 20);
 	userListScroll = [[NSScrollView alloc] initWithFrame:userFrame];
 	[userListScroll setHasVerticalScroller:YES];
 	[userListScroll setHasHorizontalScroller:NO];
 	[userListScroll setAutoresizingMask:
 		(NSViewWidthSizable | NSViewHeightSizable)];
 
-	/*
-	 * COCOA LESSON: NSTableView
-	 *
-	 * A flat table (not hierarchical like NSOutlineView).
-	 * Perfect for a simple list of nicks.
-	 *
-	 * Like NSOutlineView, it uses a data source to ask
-	 * "how many rows?" and "what's in row N?"
-	 */
 	userListTable = [[NSTableView alloc] initWithFrame:
 		[[userListScroll contentView] bounds]];
-
 	NSTableColumn *userCol = [[NSTableColumn alloc]
 		initWithIdentifier:@"nicks"];
-	[userCol setWidth:130];
+	[userCol setWidth:140];
 	[userCol setTitle:@"Users"];
 	[userListTable addTableColumn:userCol];
-
-	[userListTable setHeaderView:nil];  /* No header row. */
-
+	[userListTable setHeaderView:nil];
 	[userListTable setDataSource:
 		(id<NSTableViewDataSource>)userListDataSource];
 	[userListTable setDelegate:
 		(id<NSTableViewDelegate>)userListDataSource];
-
 	[userListScroll setDocumentView:userListTable];
 
-	/* --- Assemble the split view (order = left, center, right) --- */
+	[rightWrapper addSubview:userListScroll];
+
+	/* --- Assemble the split view --- */
 	[splitView addSubview:channelTreeScroll];
-	[splitView addSubview:chatScrollView];
-	[splitView addSubview:userListScroll];
+	[splitView addSubview:centerWrapper];
+	[splitView addSubview:rightWrapper];
 
 	[content addSubview:splitView];
 
-	/*
-	 * Set initial divider positions.
-	 *
-	 * setPosition:ofDividerAtIndex: sets where a divider sits.
-	 * Divider 0 = between pane 0 and pane 1 (tree | chat)
-	 * Divider 1 = between pane 1 and pane 2 (chat | users)
-	 *
-	 * IMPORTANT: We call adjustSubviews first, then set positions
-	 * AFTER adding the split view to the window. This ensures
-	 * the split view knows its own size and can lay out properly.
-	 */
 	[splitView adjustSubviews];
 	[splitView setPosition:180 ofDividerAtIndex:0];
-	[splitView setPosition:(bounds.size.width - 150) ofDividerAtIndex:1];
+	[splitView setPosition:(bounds.size.width - 160) ofDividerAtIndex:1];
 
 	/* Show the window. */
 	[mainWindow makeKeyAndOrderFront:nil];
@@ -608,40 +936,63 @@ create_main_window (void)
 
 
 /* ==========================================================================
- *  MENU BAR
+ *  MENU BAR — Now includes Server List and DCC items
  * ==========================================================================
  */
+
+/* Menu action targets — we need a class to receive selectors. */
+@interface HCMenuTarget : NSObject
+- (void)openServerList:(id)sender;
+- (void)openDCCPanel:(id)sender;
+@end
+
+@implementation HCMenuTarget
+- (void)openServerList:(id)sender { show_server_list (); }
+- (void)openDCCPanel:(id)sender   { show_dcc_panel (); }
+@end
+
+static id menuTarget;
 
 static void
 create_menu_bar (void)
 {
+	menuTarget = [[HCMenuTarget alloc] init];
+
 	NSMenu *menuBar = [[NSMenu alloc] init];
+
+	/* --- App menu --- */
 	NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
 	[menuBar addItem:appMenuItem];
-
 	NSMenu *appMenu = [[NSMenu alloc] init];
-	NSMenuItem *quitItem = [[NSMenuItem alloc]
-		initWithTitle:@"Quit HexChat"
-		action:@selector(terminate:)
-		keyEquivalent:@"q"];
-	[appMenu addItem:quitItem];
+	[appMenu addItemWithTitle:@"Quit HexChat"
+		action:@selector(terminate:) keyEquivalent:@"q"];
 	[appMenuItem setSubmenu:appMenu];
+
+	/* --- IRC menu --- */
+	NSMenuItem *ircMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:ircMenuItem];
+	NSMenu *ircMenu = [[NSMenu alloc] initWithTitle:@"IRC"];
+
+	NSMenuItem *srvItem = [[NSMenuItem alloc]
+		initWithTitle:@"Server List..."
+		action:@selector(openServerList:) keyEquivalent:@"s"];
+	[srvItem setTarget:menuTarget];
+	[ircMenu addItem:srvItem];
+
+	NSMenuItem *dccItem = [[NSMenuItem alloc]
+		initWithTitle:@"DCC Transfers..."
+		action:@selector(openDCCPanel:) keyEquivalent:@"t"];
+	[dccItem setTarget:menuTarget];
+	[ircMenu addItem:dccItem];
+
+	[ircMenuItem setSubmenu:ircMenu];
 
 	[NSApp setMainMenu:menuBar];
 }
 
 
 /* ==========================================================================
- *  SESSION SWITCHING — The core of the single-window architecture
- * ==========================================================================
- *
- *  When the user clicks a channel in the tree, we:
- *  1. Save the current input text (if any)
- *  2. Swap the text view's text storage to the new session's buffer
- *  3. Reload the user list table
- *  4. Update current_sess and window title
- *  5. Restore the new session's input text
- *  6. Scroll chat to the bottom
+ *  SESSION SWITCHING
  * ==========================================================================
  */
 
@@ -653,7 +1004,7 @@ switch_to_session (struct session *sess)
 
 	@autoreleasepool
 	{
-		/* Step 1: Save current session's input text. */
+		/* Save current session's input text. */
 		if (current_sess && current_sess->gui)
 		{
 			const char *curText = [[inputField stringValue] UTF8String];
@@ -661,66 +1012,57 @@ switch_to_session (struct session *sess)
 			current_sess->gui->input_text = g_strdup (curText ? curText : "");
 		}
 
-		/* Step 2: Update HexChat's session pointers. */
+		/* Update HexChat's session pointers. */
 		current_sess = sess;
 		current_tab = sess;
 		if (sess->server)
 			sess->server->front_session = sess;
 
-		/*
-		 * Step 3: Swap the text storage.
-		 *
-		 * COCOA LESSON: NSLayoutManager + replaceTextStorage
-		 *
-		 * NSTextView displays text via a chain:
-		 *   NSTextStorage → NSLayoutManager → NSTextContainer → NSTextView
-		 *
-		 * NSTextStorage holds the actual text data.
-		 * NSLayoutManager turns text into positioned glyphs.
-		 * NSTextContainer defines the region where text is laid out.
-		 * NSTextView renders everything on screen.
-		 *
-		 * To show different text, we swap the NSTextStorage.
-		 * The layout manager re-lays out from the new storage,
-		 * and the text view instantly shows different content.
-		 */
+		/* Swap the text storage. */
 		NSTextStorage *storage = get_text_storage (sess);
 		if (storage && chatTextView)
 		{
 			[[chatTextView layoutManager] replaceTextStorage:storage];
-
-			/* Scroll to the bottom. */
 			NSRange endRange = NSMakeRange ([[storage string] length], 0);
 			[chatTextView scrollRangeToVisible:endRange];
 		}
 
-		/* Step 4: Reload the user list for this session. */
+		/* Reload the user list. */
 		[userListTable reloadData];
 
-		/* Step 5: Update window title. */
-		NSString *title;
-		if (sess->channel[0])
-			title = [NSString stringWithUTF8String:sess->channel];
-		else
-			title = @"HexChat";
+		/* Update window title. */
+		NSString *title = sess->channel[0]
+			? [NSString stringWithUTF8String:sess->channel]
+			: @"HexChat";
 		[mainWindow setTitle:title];
 
-		/* Step 6: Restore this session's saved input text. */
+		/* Feature 3: Update topic bar. */
+		if (sess->topic && sess->topic[0])
+			[topicBar setStringValue:
+				[NSString stringWithUTF8String:sess->topic]];
+		else
+			[topicBar setStringValue:@""];
+
+		/* Feature 2: Update user count. */
+		update_user_count_label ();
+
+		/* Restore input text. */
 		if (sess->gui->input_text)
 			[inputField setStringValue:
 				[NSString stringWithUTF8String:sess->gui->input_text]];
 		else
 			[inputField setStringValue:@""];
+
+		/* Reset tab completion on session switch. */
+		completionMatches = nil;
+		completionPrefix = nil;
+		completionIndex = 0;
 	}
 }
 
 
 /* ==========================================================================
- *  CHANNEL TREE REFRESH — Rebuild the tree data from HexChat's sess_list
- * ==========================================================================
- *
- *  We iterate through HexChat's global session list, group sessions by
- *  server, and build HCServerNode/HCSessionNode objects.
+ *  CHANNEL TREE REFRESH
  * ==========================================================================
  */
 
@@ -731,7 +1073,6 @@ refresh_channel_tree (void)
 	{
 		[serverNodes removeAllObjects];
 
-		/* Walk the global session list. */
 		GSList *slist;
 		for (slist = sess_list; slist; slist = slist->next)
 		{
@@ -739,7 +1080,6 @@ refresh_channel_tree (void)
 			if (!sess || !sess->server)
 				continue;
 
-			/* Find or create the server node. */
 			HCServerNode *srvNode = nil;
 			for (HCServerNode *existing in serverNodes)
 			{
@@ -756,20 +1096,14 @@ refresh_channel_tree (void)
 				[serverNodes addObject:srvNode];
 			}
 
-			/* Add this session as a child. */
 			HCSessionNode *sessNode = [[HCSessionNode alloc]
 				initWithSession:sess];
 			[srvNode.children addObject:sessNode];
 		}
 
-		/* Reload and expand. */
 		[channelTree reloadData];
 		[channelTree expandItem:nil expandChildren:YES];
 
-		/*
-		 * Select the current session in the tree so the user
-		 * can see which channel is active.
-		 */
 		if (current_sess)
 		{
 			for (NSInteger i = 0; i < [channelTree numberOfRows]; i++)
@@ -790,22 +1124,10 @@ refresh_channel_tree (void)
 
 
 /* ==========================================================================
- *  USER LIST REFRESH — Rebuild the user array from HexChat's user tree
+ *  USER LIST REBUILD — Now creates attributed strings with badges
  * ==========================================================================
  */
 
-static void
-refresh_user_list (void)
-{
-	[userListTable reloadData];
-}
-
-/*
- * Rebuild the NSMutableArray from the session's usertree.
- *
- * HexChat stores users in a balanced binary tree (tree *).
- * We need to flatten it into our NSMutableArray.
- */
 static void
 rebuild_user_list_data (struct session *sess)
 {
@@ -820,34 +1142,206 @@ rebuild_user_list_data (struct session *sess)
 	{
 		[users removeAllObjects];
 
-		/* Walk the user tree. tree_foreach calls our callback for each user. */
 		tree *ut = sess->usertree;
 		if (ut)
 		{
-			/*
-			 * tree_foreach isn't available in all builds, so we use
-			 * the userlist count and just show the count in the title.
-			 * For the actual list, we iterate with tree_foreach.
-			 */
 			GList *list = userlist_double_list (sess);
-			GList *iter;
-			for (iter = list; iter; iter = iter->next)
+			for (GList *iter = list; iter; iter = iter->next)
 			{
 				struct User *user = iter->data;
 				if (user)
 				{
-					NSString *nick;
-					if (user->prefix[0])
-						nick = [NSString stringWithFormat:@"%c%s",
-							user->prefix[0], user->nick];
-					else
-						nick = [NSString stringWithUTF8String:user->nick];
-					if (nick)
-						[users addObject:nick];
+					NSAttributedString *entry =
+						make_user_list_entry (user->prefix[0], user->nick);
+					if (entry)
+						[users addObject:entry];
 				}
 			}
 			g_list_free (list);
 		}
+	}
+}
+
+
+/* ==========================================================================
+ *  FEATURE 5 — Server List Dialog
+ * ==========================================================================
+ */
+
+static void
+show_server_list (void)
+{
+	@autoreleasepool
+	{
+		if (serverListWindow)
+		{
+			[serverListWindow makeKeyAndOrderFront:nil];
+			return;
+		}
+
+		/* Build the network list from HexChat's global network_list. */
+		serverListNets = [[NSMutableArray alloc] init];
+		GSList *sl;
+		for (sl = network_list; sl; sl = sl->next)
+		{
+			ircnet *net = sl->data;
+			if (net)
+				[serverListNets addObject:[NSValue valueWithPointer:net]];
+		}
+
+		/* Create the window. */
+		NSRect frame = NSMakeRect (200, 200, 400, 500);
+		serverListWindow = [[NSWindow alloc]
+			initWithContentRect:frame
+			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+				| NSWindowStyleMaskResizable)
+			backing:NSBackingStoreBuffered
+			defer:NO];
+		[serverListWindow setTitle:@"Server List"];
+		[serverListWindow setMinSize:NSMakeSize(300, 300)];
+
+		NSView *content = [serverListWindow contentView];
+		NSRect bounds = [content bounds];
+
+		/* Connect button (bottom). */
+		NSButton *connectBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (bounds.size.width - 110, 10, 100, 32)];
+		[connectBtn setTitle:@"Connect"];
+		[connectBtn setBezelStyle:NSBezelStyleRounded];
+		[connectBtn setTarget:menuTarget];
+		[connectBtn setAction:@selector(connectFromServerList:)];
+		[connectBtn setAutoresizingMask:
+			(NSViewMinXMargin | NSViewMaxYMargin)];
+		[content addSubview:connectBtn];
+
+		/* Table view. */
+		NSRect tableFrame = NSMakeRect (0, 50, bounds.size.width,
+			bounds.size.height - 50);
+		NSScrollView *scroll = [[NSScrollView alloc]
+			initWithFrame:tableFrame];
+		[scroll setHasVerticalScroller:YES];
+		[scroll setAutoresizingMask:
+			(NSViewWidthSizable | NSViewHeightSizable)];
+
+		serverListTable = [[NSTableView alloc]
+			initWithFrame:[[scroll contentView] bounds]];
+		NSTableColumn *col = [[NSTableColumn alloc]
+			initWithIdentifier:@"network"];
+		[col setWidth:380];
+		[col setTitle:@"Network"];
+		[serverListTable addTableColumn:col];
+		[serverListTable setHeaderView:nil];
+
+		serverListDataSource = [[HCServerListDataSource alloc] init];
+		[serverListTable setDataSource:
+			(id<NSTableViewDataSource>)serverListDataSource];
+		[serverListTable setDelegate:
+			(id<NSTableViewDelegate>)serverListDataSource];
+		[serverListTable setDoubleAction:@selector(connectFromServerList:)];
+		[serverListTable setTarget:menuTarget];
+
+		[scroll setDocumentView:serverListTable];
+		[content addSubview:scroll];
+
+		[serverListWindow makeKeyAndOrderFront:nil];
+	}
+}
+
+/* Connect action for server list. */
+@implementation HCMenuTarget (ServerList)
+- (void)connectFromServerList:(id)sender
+{
+	NSInteger row = [serverListTable selectedRow];
+	if (row < 0 || !serverListNets ||
+		row >= (NSInteger)[serverListNets count])
+		return;
+
+	ircnet *net = [serverListNets[row] pointerValue];
+	if (!net) return;
+
+	/* Close the dialog. */
+	[serverListWindow orderOut:nil];
+
+	/* Connect using the first available session. */
+	struct session *sess = current_sess;
+	if (!sess && sess_list)
+		sess = sess_list->data;
+	if (sess)
+		servlist_connect (sess, net, TRUE);
+}
+@end
+
+
+/* ==========================================================================
+ *  FEATURE 6 — DCC Transfers Panel
+ * ==========================================================================
+ */
+
+static void
+show_dcc_panel (void)
+{
+	@autoreleasepool
+	{
+		if (dccWindow)
+		{
+			[dccWindow makeKeyAndOrderFront:nil];
+			return;
+		}
+
+		if (!dccTransfers)
+			dccTransfers = [[NSMutableArray alloc] init];
+
+		NSRect frame = NSMakeRect (250, 150, 700, 350);
+		dccWindow = [[NSWindow alloc]
+			initWithContentRect:frame
+			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+				| NSWindowStyleMaskResizable)
+			backing:NSBackingStoreBuffered
+			defer:NO];
+		[dccWindow setTitle:@"DCC Transfers"];
+		[dccWindow setMinSize:NSMakeSize(500, 200)];
+
+		NSView *content = [dccWindow contentView];
+		NSRect bounds = [content bounds];
+
+		NSScrollView *scroll = [[NSScrollView alloc]
+			initWithFrame:bounds];
+		[scroll setHasVerticalScroller:YES];
+		[scroll setAutoresizingMask:
+			(NSViewWidthSizable | NSViewHeightSizable)];
+
+		dccTable = [[NSTableView alloc]
+			initWithFrame:[[scroll contentView] bounds]];
+
+		/* Create columns: Nick, File, Size, Progress, Speed, Status */
+		struct { const char *ident; const char *title; CGFloat w; }
+		cols[] = {
+			{"nick",     "Nick",     80},
+			{"file",     "File",     200},
+			{"size",     "Size",     80},
+			{"progress", "Progress", 70},
+			{"speed",    "Speed",    80},
+			{"status",   "Status",   70},
+		};
+		for (int i = 0; i < 6; i++)
+		{
+			NSTableColumn *c = [[NSTableColumn alloc]
+				initWithIdentifier:
+					[NSString stringWithUTF8String:cols[i].ident]];
+			[c setWidth:cols[i].w];
+			[[c headerCell] setStringValue:
+				[NSString stringWithUTF8String:cols[i].title]];
+			[dccTable addTableColumn:c];
+		}
+
+		dccDataSource = [[HCDCCDataSource alloc] init];
+		[dccTable setDataSource:(id<NSTableViewDataSource>)dccDataSource];
+		[dccTable setDelegate:(id<NSTableViewDelegate>)dccDataSource];
+
+		[scroll setDocumentView:dccTable];
+		[content addSubview:scroll];
+
+		[dccWindow makeKeyAndOrderFront:nil];
 	}
 }
 
@@ -859,7 +1353,7 @@ rebuild_user_list_data (struct session *sess)
  * ==========================================================================
  */
 
-/* --- Command-line arguments (same as Phase 1) --- */
+/* --- Command-line arguments --- */
 
 static char *arg_cfgdir = NULL;
 static gint arg_show_autoload = 0;
@@ -943,7 +1437,7 @@ fe_init (void)
 	prefs.hex_gui_tab_server = 0;
 	prefs.hex_gui_autoopen_dialog = 0;
 	prefs.hex_gui_lagometer = 0;
-	prefs.hex_gui_slist_skip = 1;
+	prefs.hex_gui_slist_skip = 0;  /* Feature 5: Show server list on startup */
 
 	@autoreleasepool
 	{
@@ -957,6 +1451,9 @@ fe_init (void)
 		userListDataSource = [[HCUserListDataSource alloc] init];
 
 		serverNodes = [[NSMutableArray alloc] init];
+
+		/* Feature 1: Initialize mIRC color palette. */
+		init_mirc_colors ();
 
 		create_menu_bar ();
 		create_main_window ();
@@ -1004,7 +1501,7 @@ fe_exit (void)
 }
 
 
-/* --- Timers and I/O (unchanged from Phase 1) --- */
+/* --- Timers and I/O --- */
 
 int
 fe_timeout_add (int interval, void *callback, void *userdata)
@@ -1042,11 +1539,6 @@ void fe_idle_add (void *func, void *data) { g_idle_add (func, data); }
 
 /* --------------------------------------------------------------------------
  *  fe_new_window — A new session was created.
- *
- *  Phase 2: We no longer create a new window. Instead:
- *  1. Allocate session_gui with its own NSTextStorage + user array
- *  2. Add the session to the channel tree
- *  3. If focused, switch to it
  * -------------------------------------------------------------------------- */
 void
 fe_new_window (struct session *sess, int focus)
@@ -1063,32 +1555,14 @@ fe_new_window (struct session *sess, int focus)
 
 	@autoreleasepool
 	{
-		/*
-		 * Create this session's text storage (its own chat buffer).
-		 *
-		 * NSTextStorage is a subclass of NSMutableAttributedString.
-		 * Each session gets its own so text is preserved when switching.
-		 */
 		NSTextStorage *storage = [[NSTextStorage alloc] init];
 		gui->text_storage = (void *)CFBridgingRetain (storage);
 
-		/* Create the user list array. */
 		NSMutableArray *users = [[NSMutableArray alloc] init];
 		gui->user_list_data = (void *)CFBridgingRetain (users);
 
-		/* Refresh the channel tree to include this new session. */
 		refresh_channel_tree ();
 
-		/*
-		 * If this should be focused (or it's the first session), switch.
-		 *
-		 * BUG FIX: Do NOT set current_sess before calling switch_to_session!
-		 * switch_to_session() has an early-return check:
-		 *   if (sess == current_sess) return;
-		 * Setting current_sess first made it skip all the setup —
-		 * the text storage was never connected to the text view,
-		 * so text went into the buffer but was invisible.
-		 */
 		if (focus || !current_sess)
 		{
 			switch_to_session (sess);
@@ -1118,79 +1592,242 @@ fe_new_server (struct server *serv)
 
 
 /* --------------------------------------------------------------------------
- *  fe_print_text — Append text to the session's text storage.
+ *  FEATURE 1 — fe_print_text: mIRC color + formatting parser
  *
- *  Phase 2 change: We write to the session's OWN text storage,
- *  not directly to the text view. If this session is currently
- *  visible, the change appears immediately (because the layout
- *  manager is connected to this storage). If not, the text is
- *  buffered and appears when the user switches to this session.
+ *  This is the core of Feature 1. Instead of stripping formatting codes,
+ *  we parse them into NSAttributedString spans with colors and styles.
+ *
+ *  mIRC formatting codes:
+ *    \002       Toggle bold
+ *    \003NN     Set foreground color to palette index NN
+ *    \003NN,MM  Set foreground to NN, background to MM
+ *    \003       Reset colors (no digits)
+ *    \017       Reset ALL formatting (colors, bold, italic, etc.)
+ *    \026       Toggle reverse (swap fg/bg)
+ *    \035       Toggle italic
+ *    \036       Toggle strikethrough
+ *    \037       Toggle underline
  * -------------------------------------------------------------------------- */
 void
 fe_print_text (struct session *sess, char *text, time_t stamp,
                gboolean no_activity)
 {
 	NSTextStorage *storage = get_text_storage (sess);
-	if (!storage)
+	if (!storage || !text)
 		return;
 
 	@autoreleasepool
 	{
-		/* Strip mIRC formatting codes. */
 		int len = strlen (text);
-		char *clean = g_malloc (len + 1);
-		int i = 0, j = 0;
+		NSMutableAttributedString *output =
+			[[NSMutableAttributedString alloc] init];
 
-		while (i < len)
-		{
-			switch (text[i])
+		/* Current formatting state. */
+		int fgColor = -1;       /* -1 = default (light grey)           */
+		int bgColor = -1;       /* -1 = default (transparent)          */
+		BOOL isBold = NO;
+		BOOL isItalic = NO;
+		BOOL isUnderline = NO;
+		BOOL isStrikethrough = NO;
+		BOOL isReverse = NO;
+
+		/* Default colors for our dark background. */
+		NSColor *defaultFg = [NSColor colorWithWhite:0.9 alpha:1.0];
+		NSFont *regularFont = [NSFont monospacedSystemFontOfSize:12
+			weight:NSFontWeightRegular];
+		NSFont *boldFont = [NSFont monospacedSystemFontOfSize:12
+			weight:NSFontWeightBold];
+
+		/* Parse character by character. */
+		char *clean = g_malloc (len + 1);  /* Buffer for current span text. */
+		__block int cleanLen = 0;
+
+		/* Helper: flush the current span with current formatting. */
+		void (^flushSpan)(void) = ^{
+			if (cleanLen == 0) return;
+			clean[cleanLen] = '\0';
+
+			NSString *nsStr = [NSString stringWithUTF8String:clean];
+			if (!nsStr)
+				nsStr = [[NSString alloc] initWithBytes:clean length:cleanLen
+					encoding:NSISOLatin1StringEncoding];
+			if (!nsStr) { cleanLen = 0; return; }
+
+			/* Determine colors. */
+			NSColor *fg, *bg;
+			if (isReverse)
 			{
-			case '\003':
-				i++;
-				if (i < len && text[i] >= '0' && text[i] <= '9') i++;
-				if (i < len && text[i] >= '0' && text[i] <= '9') i++;
-				if (i < len && text[i] == ',')
-				{
-					i++;
-					if (i < len && text[i] >= '0' && text[i] <= '9') i++;
-					if (i < len && text[i] >= '0' && text[i] <= '9') i++;
-				}
-				continue;
-			case '\002': case '\017': case '\026':
-			case '\037': case '\010':
-				break;
-			default:
-				clean[j++] = text[i];
-				break;
+				fg = (bgColor >= 0 && bgColor < 16)
+					? mircColors[bgColor] : [NSColor colorWithWhite:0.1 alpha:1.0];
+				bg = (fgColor >= 0 && fgColor < 16)
+					? mircColors[fgColor] : defaultFg;
 			}
-			i++;
-		}
-		clean[j] = '\0';
+			else
+			{
+				fg = (fgColor >= 0 && fgColor < 16)
+					? mircColors[fgColor] : defaultFg;
+				bg = (bgColor >= 0 && bgColor < 16)
+					? mircColors[bgColor] : nil;
+			}
 
-		NSString *nsText = [NSString stringWithUTF8String:clean];
-		if (!nsText)
-			nsText = [[NSString alloc] initWithBytes:clean length:j
-				encoding:NSISOLatin1StringEncoding];
-		g_free (clean);
-		if (!nsText) return;
+			NSFont *font;
+			if (isBold && isItalic)
+			{
+				/* Bold italic — get the bold font and apply italic trait. */
+				NSFontDescriptor *desc = [boldFont fontDescriptor];
+				desc = [desc fontDescriptorWithSymbolicTraits:
+					NSFontDescriptorTraitBold | NSFontDescriptorTraitItalic];
+				font = [NSFont fontWithDescriptor:desc size:12];
+				if (!font) font = boldFont;
+			}
+			else if (isBold)
+				font = boldFont;
+			else if (isItalic)
+			{
+				NSFontDescriptor *desc = [regularFont fontDescriptor];
+				desc = [desc fontDescriptorWithSymbolicTraits:
+					NSFontDescriptorTraitItalic];
+				font = [NSFont fontWithDescriptor:desc size:12];
+				if (!font) font = regularFont;
+			}
+			else
+				font = regularFont;
 
-		NSDictionary *attrs = @{
-			NSForegroundColorAttributeName:
-				[NSColor colorWithWhite:0.9 alpha:1.0],
-			NSFontAttributeName:
-				[NSFont monospacedSystemFontOfSize:12
-					weight:NSFontWeightRegular],
+			NSMutableDictionary *attrs = [NSMutableDictionary dictionaryWithDictionary:@{
+				NSForegroundColorAttributeName: fg,
+				NSFontAttributeName: font,
+			}];
+
+			if (bg)
+				attrs[NSBackgroundColorAttributeName] = bg;
+			if (isUnderline)
+				attrs[NSUnderlineStyleAttributeName] =
+					@(NSUnderlineStyleSingle);
+			if (isStrikethrough)
+				attrs[NSStrikethroughStyleAttributeName] =
+					@(NSUnderlineStyleSingle);
+
+			NSAttributedString *span = [[NSAttributedString alloc]
+				initWithString:nsStr attributes:attrs];
+			[output appendAttributedString:span];
+
+			cleanLen = 0;
 		};
 
-		NSAttributedString *attrText = [[NSAttributedString alloc]
-			initWithString:nsText attributes:attrs];
+		int i = 0;
+		while (i < len)
+		{
+			unsigned char ch = (unsigned char)text[i];
+			switch (ch)
+			{
+			case '\002':  /* Bold toggle */
+				flushSpan ();
+				isBold = !isBold;
+				i++;
+				break;
 
+			case '\003':  /* Color */
+			{
+				flushSpan ();
+				i++;
+				/* Parse optional foreground color (1-2 digits). */
+				if (i < len && text[i] >= '0' && text[i] <= '9')
+				{
+					fgColor = text[i] - '0';
+					i++;
+					if (i < len && text[i] >= '0' && text[i] <= '9')
+					{
+						fgColor = fgColor * 10 + (text[i] - '0');
+						i++;
+					}
+					fgColor %= 16;  /* Wrap to valid range. */
+
+					/* Parse optional background color. */
+					if (i < len && text[i] == ',')
+					{
+						i++;
+						if (i < len && text[i] >= '0' && text[i] <= '9')
+						{
+							bgColor = text[i] - '0';
+							i++;
+							if (i < len && text[i] >= '0' && text[i] <= '9')
+							{
+								bgColor = bgColor * 10 + (text[i] - '0');
+								i++;
+							}
+							bgColor %= 16;
+						}
+					}
+				}
+				else
+				{
+					/* \003 with no digits = reset colors. */
+					fgColor = -1;
+					bgColor = -1;
+				}
+				break;
+			}
+
+			case '\017':  /* Reset ALL formatting */
+				flushSpan ();
+				fgColor = -1;
+				bgColor = -1;
+				isBold = NO;
+				isItalic = NO;
+				isUnderline = NO;
+				isStrikethrough = NO;
+				isReverse = NO;
+				i++;
+				break;
+
+			case '\026':  /* Reverse toggle */
+				flushSpan ();
+				isReverse = !isReverse;
+				i++;
+				break;
+
+			case '\035':  /* Italic toggle */
+				flushSpan ();
+				isItalic = !isItalic;
+				i++;
+				break;
+
+			case '\036':  /* Strikethrough toggle */
+				flushSpan ();
+				isStrikethrough = !isStrikethrough;
+				i++;
+				break;
+
+			case '\037':  /* Underline toggle */
+				flushSpan ();
+				isUnderline = !isUnderline;
+				i++;
+				break;
+
+			case '\010':  /* Backspace (legacy, skip) */
+				i++;
+				break;
+
+			default:
+				clean[cleanLen++] = text[i];
+				i++;
+				break;
+			}
+		}
+
+		/* Flush any remaining text. */
+		flushSpan ();
+		g_free (clean);
+
+		if ([output length] == 0)
+			return;
+
+		/* Append to the session's text storage (thread-safe). */
 		dispatch_async (dispatch_get_main_queue (), ^{
 			[storage beginEditing];
-			[storage appendAttributedString:attrText];
+			[storage appendAttributedString:output];
 			[storage endEditing];
 
-			/* If this is the visible session, scroll to bottom. */
 			if (sess == current_sess && chatTextView)
 			{
 				NSRange endRange = NSMakeRange (
@@ -1203,7 +1840,7 @@ fe_print_text (struct session *sess, char *text, time_t stamp,
 
 
 /* --------------------------------------------------------------------------
- *  fe_close_window — Session closed. Remove from tree, free resources.
+ *  fe_close_window — Session closed.
  * -------------------------------------------------------------------------- */
 void
 fe_close_window (struct session *sess)
@@ -1225,7 +1862,6 @@ fe_close_window (struct session *sess)
 
 	session_free (sess);
 
-	/* Refresh tree after removal. */
 	dispatch_async (dispatch_get_main_queue (), ^{
 		refresh_channel_tree ();
 	});
@@ -1233,14 +1869,28 @@ fe_close_window (struct session *sess)
 
 
 /* --------------------------------------------------------------------------
- *  fe_set_topic — Channel topic changed.
+ *  Feature 3: fe_set_topic — Update topic bar
  * -------------------------------------------------------------------------- */
 void
 fe_set_topic (struct session *sess, char *topic, char *stripped_topic)
 {
-	if (sess == current_sess && mainWindow && stripped_topic)
+	if (!stripped_topic) return;
+
+	/* Save topic in session gui for later restore. */
+	if (sess->gui)
+	{
+		g_free (sess->gui->topic_text);
+		sess->gui->topic_text = g_strdup (stripped_topic);
+	}
+
+	if (sess == current_sess)
 	{
 		dispatch_async (dispatch_get_main_queue (), ^{
+			if (topicBar)
+				[topicBar setStringValue:
+					[NSString stringWithUTF8String:stripped_topic]];
+
+			/* Also update window title. */
 			NSString *title;
 			if (sess->channel[0])
 				title = [NSString stringWithFormat:@"%s — %s",
@@ -1272,7 +1922,6 @@ void
 fe_set_channel (struct session *sess)
 {
 	fe_set_title (sess);
-	/* Also refresh the tree so the channel name updates. */
 	dispatch_async (dispatch_get_main_queue (), ^{
 		refresh_channel_tree ();
 	});
@@ -1375,7 +2024,7 @@ void
 fe_set_inputbox_contents (struct session *sess, char *text)
 {
 	if (!inputField || !text) return;
-	if (sess != current_sess) return;  /* Only update if visible. */
+	if (sess != current_sess) return;
 	dispatch_async (dispatch_get_main_queue (), ^{
 		[inputField setStringValue:
 			[NSString stringWithUTF8String:text]];
@@ -1474,7 +2123,6 @@ const char *fe_get_default_font (void) { return "Menlo 12"; }
 void
 fe_server_event (server *serv, int type, int arg)
 {
-	/* Refresh tree when server connects (name becomes available). */
 	dispatch_async (dispatch_get_main_queue (), ^{
 		refresh_channel_tree ();
 	});
@@ -1486,7 +2134,7 @@ void fe_get_int (char *prompt, int def, void *callback, void *ud) {}
 
 
 /* ==========================================================================
- *  USER LIST FUNCTIONS — Phase 2 implementations
+ *  USER LIST FUNCTIONS — Phase 3: badges + user count
  * ==========================================================================
  */
 
@@ -1499,19 +2147,15 @@ fe_userlist_insert (struct session *sess, struct User *newuser, gboolean sel)
 
 	@autoreleasepool
 	{
-		NSString *nick;
-		if (newuser->prefix[0])
-			nick = [NSString stringWithFormat:@"%c%s",
-				newuser->prefix[0], newuser->nick];
-		else
-			nick = [NSString stringWithUTF8String:newuser->nick];
-
-		if (nick)
-			[users addObject:nick];
+		NSAttributedString *entry =
+			make_user_list_entry (newuser->prefix[0], newuser->nick);
+		if (entry)
+			[users addObject:entry];
 
 		if (sess == current_sess)
 			dispatch_async (dispatch_get_main_queue (), ^{
 				[userListTable reloadData];
+				update_user_count_label ();
 			});
 	}
 }
@@ -1526,14 +2170,14 @@ fe_userlist_remove (struct session *sess, struct User *user)
 
 	@autoreleasepool
 	{
-		/* Find and remove the nick. */
 		NSString *target = [NSString stringWithUTF8String:user->nick];
 		for (NSInteger i = (NSInteger)[users count] - 1; i >= 0; i--)
 		{
-			NSString *entry = users[i];
-			/* Entry might have a prefix char, so check if it ends with the nick. */
-			if ([entry isEqualToString:target] ||
-				([entry length] > 0 && [[entry substringFromIndex:1] isEqualToString:target]))
+			/* Each entry is an NSAttributedString. Check if it contains the nick. */
+			NSAttributedString *entry = users[i];
+			NSString *plainText = [entry string];
+			/* The plain text is like "● nick" or "● nick" (invisible circle). */
+			if ([plainText rangeOfString:target].location != NSNotFound)
 			{
 				[users removeObjectAtIndex:i];
 				break;
@@ -1543,6 +2187,7 @@ fe_userlist_remove (struct session *sess, struct User *user)
 		if (sess == current_sess)
 			dispatch_async (dispatch_get_main_queue (), ^{
 				[userListTable reloadData];
+				update_user_count_label ();
 			});
 	}
 	return 0;
@@ -1552,11 +2197,11 @@ fe_userlist_remove (struct session *sess, struct User *user)
 void
 fe_userlist_rehash (struct session *sess, struct User *user)
 {
-	/* Rebuild the entire list (prefix may have changed). */
 	rebuild_user_list_data (sess);
 	if (sess == current_sess)
 		dispatch_async (dispatch_get_main_queue (), ^{
 			[userListTable reloadData];
+			update_user_count_label ();
 		});
 }
 
@@ -1571,10 +2216,10 @@ fe_userlist_update (session *sess, struct User *user)
 void
 fe_userlist_numbers (struct session *sess)
 {
-	/* Could update a "N users" label. For now, just refresh. */
 	if (sess == current_sess)
 		dispatch_async (dispatch_get_main_queue (), ^{
 			[userListTable reloadData];
+			update_user_count_label ();
 		});
 }
 
@@ -1589,7 +2234,117 @@ fe_userlist_clear (struct session *sess)
 	if (sess == current_sess)
 		dispatch_async (dispatch_get_main_queue (), ^{
 			[userListTable reloadData];
+			update_user_count_label ();
 		});
+}
+
+
+/* ==========================================================================
+ *  DCC FUNCTIONS — Feature 6
+ * ==========================================================================
+ */
+
+void
+fe_dcc_add (struct DCC *dcc)
+{
+	if (!dcc) return;
+	if (!dccTransfers)
+		dccTransfers = [[NSMutableArray alloc] init];
+
+	@autoreleasepool
+	{
+		[dccTransfers addObject:(__bridge id)(void *)dcc];
+		if (dccTable)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[dccTable reloadData];
+			});
+	}
+}
+
+void
+fe_dcc_update (struct DCC *dcc)
+{
+	if (dccTable)
+		dispatch_async (dispatch_get_main_queue (), ^{
+			[dccTable reloadData];
+		});
+}
+
+void
+fe_dcc_remove (struct DCC *dcc)
+{
+	if (!dcc || !dccTransfers) return;
+	@autoreleasepool
+	{
+		/* Find and remove. */
+		for (NSInteger i = (NSInteger)[dccTransfers count] - 1; i >= 0; i--)
+		{
+			struct DCC *d = (__bridge struct DCC *)(dccTransfers[i]);
+			if (d == dcc)
+			{
+				[dccTransfers removeObjectAtIndex:i];
+				break;
+			}
+		}
+		if (dccTable)
+			dispatch_async (dispatch_get_main_queue (), ^{
+				[dccTable reloadData];
+			});
+	}
+}
+
+int
+fe_dcc_open_recv_win (int passive)
+{
+	dispatch_async (dispatch_get_main_queue (), ^{
+		show_dcc_panel ();
+	});
+	return TRUE;
+}
+
+int
+fe_dcc_open_send_win (int passive)
+{
+	dispatch_async (dispatch_get_main_queue (), ^{
+		show_dcc_panel ();
+	});
+	return TRUE;
+}
+
+int  fe_dcc_open_chat_win (int passive) { return FALSE; }
+
+void
+fe_dcc_send_filereq (struct session *sess, char *nick, int maxcps,
+	int passive)
+{
+	if (!sess || !nick) return;
+	dispatch_async (dispatch_get_main_queue (), ^{
+		@autoreleasepool {
+			NSOpenPanel *panel = [NSOpenPanel openPanel];
+			[panel setTitle:@"Send File via DCC"];
+			[panel setAllowsMultipleSelection:NO];
+			if ([panel runModal] == NSModalResponseOK)
+			{
+				const char *path = [[[panel URL] path] UTF8String];
+				if (path)
+					dcc_send (sess, nick, (char *)path, maxcps, passive);
+			}
+		}
+	});
+}
+
+
+/* ==========================================================================
+ *  SERVER LIST FUNCTION — Feature 5
+ * ==========================================================================
+ */
+
+void
+fe_serverlist_open (session *sess)
+{
+	dispatch_async (dispatch_get_main_queue (), ^{
+		show_server_list ();
+	});
 }
 
 
@@ -1611,15 +2366,6 @@ gboolean fe_add_ban_list (struct session *sess, char *mask, char *who,
 	char *when, int rplcode) { return 0; }
 gboolean fe_ban_list_end (struct session *sess, int rplcode) { return 0; }
 
-void fe_dcc_add (struct DCC *dcc) {}
-void fe_dcc_update (struct DCC *dcc) {}
-void fe_dcc_remove (struct DCC *dcc) {}
-int  fe_dcc_open_recv_win (int passive) { return FALSE; }
-int  fe_dcc_open_send_win (int passive) { return FALSE; }
-int  fe_dcc_open_chat_win (int passive) { return FALSE; }
-void fe_dcc_send_filereq (struct session *sess, char *nick, int maxcps,
-	int passive) {}
-
 void fe_notify_update (char *name) {}
 void fe_notify_ask (char *name, char *networks) {}
 
@@ -1635,7 +2381,6 @@ void fe_progressbar_end (struct server *serv) {}
 void fe_set_lag (server *serv, long lag) {}
 void fe_set_throttle (server *serv) {}
 void fe_set_away (server *serv) {}
-void fe_serverlist_open (session *sess) {}
 void fe_add_rawlog (struct server *serv, char *text, int len, int outbound) {}
 
 void fe_session_callback (struct session *sess) {}
