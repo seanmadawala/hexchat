@@ -72,6 +72,7 @@ static void refresh_channel_tree (void);
 static void update_user_count_label (void);
 static void init_mirc_colors (void);
 static void show_server_list (void);
+static void show_edit_network (ircnet *net);
 static void show_dcc_panel (void);
 
 /* Helper: get the NSTextStorage for a session. */
@@ -202,6 +203,61 @@ static NSTextField   *slNickField1;        /* Server list nick/user fields    */
 static NSTextField   *slNickField2;
 static NSTextField   *slNickField3;
 static NSTextField   *slUserField;
+
+/* --- Feature 5b: Edit Network dialog --- */
+static NSWindow      *editNetWindow;
+static ircnet        *editNet;             /* network being edited            */
+static NSTabView     *editTabView;
+static NSTableView   *editServerTable;
+static NSTableView   *editChanTable;
+static NSTableView   *editCmdTable;
+static NSTextField   *editNickField;
+static NSTextField   *editNick2Field;
+static NSTextField   *editRealField;
+static NSTextField   *editUserField;
+static NSSecureTextField *editPassField;
+static NSPopUpButton *editLoginPopup;
+static NSComboBox    *editCharsetCombo;
+static NSButton      *editChkGlobal;       /* "Use global user information"   */
+/* Fields that get grayed when "Use global" is checked. */
+static NSTextField   *editFieldsToToggle[4]; /* nick, nick2, real, user       */
+
+/* Login type mapping — must match the popup item order. */
+static const int cocoa_login_types_conf[] = {
+	0,   /* LOGIN_DEFAULT */
+	6,   /* LOGIN_SASL */
+	10,  /* LOGIN_SASLEXTERNAL */
+	11,  /* LOGIN_SASL_SCRAM_SHA_1 */
+	12,  /* LOGIN_SASL_SCRAM_SHA_256 */
+	13,  /* LOGIN_SASL_SCRAM_SHA_512 */
+	7,   /* LOGIN_PASS */
+	1,   /* LOGIN_MSG_NICKSERV */
+	2,   /* LOGIN_NICKSERV */
+	8,   /* LOGIN_CHALLENGEAUTH */
+	9,   /* LOGIN_CUSTOM */
+};
+static const int cocoa_login_types_count = 11;
+
+/* Character set list. */
+static const char *cocoa_charsets[] = {
+	"UTF-8 (Unicode)",
+	"CP1252 (Windows-1252)",
+	"ISO-8859-15 (Western Europe)",
+	"ISO-8859-2 (Central Europe)",
+	"ISO-8859-7 (Greek)",
+	"ISO-8859-8 (Hebrew)",
+	"ISO-8859-9 (Turkish)",
+	"ISO-2022-JP (Japanese)",
+	"SJIS (Japanese)",
+	"CP949 (Korean)",
+	"KOI8-R (Cyrillic)",
+	"CP1251 (Cyrillic)",
+	"CP1256 (Arabic)",
+	"CP1257 (Baltic)",
+	"GB18030 (Chinese)",
+	"TIS-620 (Thai)",
+	NULL
+};
 
 /* --- Feature 6: DCC panel --- */
 static NSWindow      *dccWindow;
@@ -1603,10 +1659,15 @@ show_server_list (void)
 
 - (void)slEdit:(id)sender
 {
-	NSAlert *a = [[NSAlert alloc] init];
-	[a setMessageText:@"Network editing is not yet implemented in the "
-		"Cocoa frontend. You can edit networks in the servlist.conf file."];
-	[a runModal];
+	NSInteger row = [serverListTable selectedRow];
+	if (row < 0 || !serverListNets ||
+		row >= (NSInteger)[serverListNets count])
+		return;
+
+	ircnet *net = [serverListNets[row] pointerValue];
+	if (!net) return;
+
+	show_edit_network (net);
 }
 
 - (void)slSort:(id)sender
@@ -1657,6 +1718,682 @@ show_server_list (void)
 		([sender state] == NSControlStateValueOn) ? 1 : 0;
 	populate_server_list_nets ();
 	[serverListTable reloadData];
+}
+
+@end
+
+
+/* ==========================================================================
+ *  FEATURE 5b — Edit Network Dialog
+ * ==========================================================================
+ */
+
+/* Forward declarations. */
+static void show_edit_network (ircnet *net);
+static void edit_toggle_global_fields (void);
+
+/* ---------- helper: get popup index for a logintype conf value ---------- */
+static int
+login_conf_to_popup_index (int conf_value)
+{
+	for (int i = 0; i < cocoa_login_types_count; i++)
+		if (cocoa_login_types_conf[i] == conf_value)
+			return i;
+	return 0;
+}
+
+/* ---------- Servers data source ---------- */
+@interface HCEditServerDS : NSObject <NSTableViewDataSource, NSTableViewDelegate>
+@end
+@implementation HCEditServerDS
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv
+{
+	return editNet ? (NSInteger)g_slist_length (editNet->servlist) : 0;
+}
+- (id)tableView:(NSTableView *)tv
+	objectValueForTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return @"";
+	ircserver *s = g_slist_nth_data (editNet->servlist, (guint)row);
+	if (!s || !s->hostname) return @"";
+	NSString *r = [NSString stringWithUTF8String:s->hostname];
+	return r ?: @"";
+}
+- (void)tableView:(NSTableView *)tv
+	setObjectValue:(id)obj
+	forTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return;
+	ircserver *s = g_slist_nth_data (editNet->servlist, (guint)row);
+	if (!s) return;
+	const char *newval = [obj UTF8String];
+	if (!newval || newval[0] == 0)
+	{
+		/* Empty string = delete the server, but keep at least one. */
+		if (g_slist_length (editNet->servlist) > 1)
+		{
+			servlist_server_remove (editNet, s);
+			[tv reloadData];
+		}
+		return;
+	}
+	g_free (s->hostname);
+	/* Convert "host:port" to "host/port". */
+	char *dup = g_strdup (newval);
+	char *colon = strchr (dup, ':');
+	if (colon && strchr (colon + 1, ':') == NULL)  /* single colon only */
+		*colon = '/';
+	s->hostname = dup;
+}
+@end
+
+/* ---------- Channels data source ---------- */
+@interface HCEditChanDS : NSObject <NSTableViewDataSource, NSTableViewDelegate>
+@end
+@implementation HCEditChanDS
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv
+{
+	return editNet ? (NSInteger)g_slist_length (editNet->favchanlist) : 0;
+}
+- (id)tableView:(NSTableView *)tv
+	objectValueForTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return @"";
+	favchannel *fc = g_slist_nth_data (editNet->favchanlist, (guint)row);
+	if (!fc) return @"";
+	if ([[col identifier] isEqualToString:@"key"])
+	{
+		if (!fc->key) return @"";
+		NSString *r = [NSString stringWithUTF8String:fc->key];
+		return r ?: @"";
+	}
+	if (!fc->name) return @"";
+	NSString *r = [NSString stringWithUTF8String:fc->name];
+	return r ?: @"";
+}
+- (void)tableView:(NSTableView *)tv
+	setObjectValue:(id)obj
+	forTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return;
+	favchannel *fc = g_slist_nth_data (editNet->favchanlist, (guint)row);
+	if (!fc) return;
+	const char *newval = [obj UTF8String];
+	if ([[col identifier] isEqualToString:@"key"])
+	{
+		g_free (fc->key);
+		fc->key = (newval && newval[0]) ? g_strdup (newval) : NULL;
+		return;
+	}
+	/* Channel name column. */
+	if (!newval || newval[0] == 0)
+	{
+		servlist_favchan_remove (editNet, fc);
+		[tv reloadData];
+		return;
+	}
+	g_free (fc->name);
+	fc->name = g_strdup (newval);
+}
+@end
+
+/* ---------- Commands data source ---------- */
+@interface HCEditCmdDS : NSObject <NSTableViewDataSource, NSTableViewDelegate>
+@end
+@implementation HCEditCmdDS
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv
+{
+	return editNet ? (NSInteger)g_slist_length (editNet->commandlist) : 0;
+}
+- (id)tableView:(NSTableView *)tv
+	objectValueForTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return @"";
+	commandentry *e = g_slist_nth_data (editNet->commandlist, (guint)row);
+	if (!e || !e->command) return @"";
+	NSString *r = [NSString stringWithUTF8String:e->command];
+	return r ?: @"";
+}
+- (void)tableView:(NSTableView *)tv
+	setObjectValue:(id)obj
+	forTableColumn:(NSTableColumn *)col
+	row:(NSInteger)row
+{
+	if (!editNet) return;
+	commandentry *e = g_slist_nth_data (editNet->commandlist, (guint)row);
+	if (!e) return;
+	const char *newval = [obj UTF8String];
+	if (!newval || newval[0] == 0)
+	{
+		servlist_command_remove (editNet, e);
+		[tv reloadData];
+		return;
+	}
+	g_free (e->command);
+	/* Strip leading slash. */
+	if (newval[0] == '/') newval++;
+	e->command = g_strdup (newval);
+}
+@end
+
+/* ----------- Keep strong references to data sources alive ----------- */
+static id editServerDS;
+static id editChanDS;
+static id editCmdDS;
+
+/* -------------------------------------------------------------------- */
+static void
+show_edit_network (ircnet *net)
+{
+	@autoreleasepool
+	{
+		if (!net) return;
+
+		/* If already open, bring to front. */
+		if (editNetWindow)
+		{
+			[editNetWindow makeKeyAndOrderFront:nil];
+			return;
+		}
+
+		editNet = net;
+
+		/* --- Window --- */
+		NSString *title = [NSString stringWithFormat:@"Edit %s - HexChat",
+			net->name ? net->name : "network"];
+		NSRect frame = NSMakeRect (250, 120, 480, 620);
+		editNetWindow = [[NSWindow alloc]
+			initWithContentRect:frame
+			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+				| NSWindowStyleMaskResizable)
+			backing:NSBackingStoreBuffered
+			defer:NO];
+		[editNetWindow setTitle:title];
+		[editNetWindow setMinSize:NSMakeSize (440, 520)];
+
+		NSView *content = [editNetWindow contentView];
+		CGFloat W = [content bounds].size.width;
+		CGFloat y = [content bounds].size.height;
+
+		/* ==============================================================
+		 *  Tab View (Servers / Autojoin channels / Connect commands)
+		 * ============================================================== */
+		CGFloat tabH = 180;
+		y -= (tabH + 10);
+		editTabView = [[NSTabView alloc]
+			initWithFrame:NSMakeRect (10, y, W - 20, tabH)];
+		[editTabView setAutoresizingMask:
+			(NSViewWidthSizable | NSViewMinYMargin)];
+
+		/* --- Helper block to create a tab with table + Add/Remove --- */
+		NSTableView *(^makeTab)(NSString *, NSString *, NSArray *,
+			id, SEL, SEL) =
+		^NSTableView *(NSString *label, NSString *ident,
+			NSArray *colDefs, id ds, SEL addSel, SEL rmSel)
+		{
+			NSTabViewItem *item = [[NSTabViewItem alloc]
+				initWithIdentifier:ident];
+			[item setLabel:label];
+			NSView *v = [[NSView alloc]
+				initWithFrame:NSMakeRect (0, 0, W - 34, tabH - 30)];
+
+			CGFloat vW = [v bounds].size.width;
+			CGFloat vH = [v bounds].size.height;
+
+			/* Buttons on right. */
+			CGFloat bW = 70, bH = 26, bX = vW - bW - 4;
+			NSButton *addBtn = [[NSButton alloc]
+				initWithFrame:NSMakeRect (bX, vH - bH - 2, bW, bH)];
+			[addBtn setTitle:@"Add"];
+			[addBtn setBezelStyle:NSBezelStyleRounded];
+			[addBtn setTarget:menuTarget];
+			[addBtn setAction:addSel];
+			[addBtn setAutoresizingMask:NSViewMinXMargin];
+			[v addSubview:addBtn];
+
+			NSButton *rmBtn = [[NSButton alloc]
+				initWithFrame:NSMakeRect (bX, vH - 2 * (bH + 4), bW, bH)];
+			[rmBtn setTitle:@"Remove"];
+			[rmBtn setBezelStyle:NSBezelStyleRounded];
+			[rmBtn setTarget:menuTarget];
+			[rmBtn setAction:rmSel];
+			[rmBtn setAutoresizingMask:NSViewMinXMargin];
+			[v addSubview:rmBtn];
+
+			/* Table. */
+			NSScrollView *sc = [[NSScrollView alloc]
+				initWithFrame:NSMakeRect (0, 0, bX - 6, vH)];
+			[sc setHasVerticalScroller:YES];
+			[sc setBorderType:NSBezelBorder];
+			[sc setAutoresizingMask:
+				(NSViewWidthSizable | NSViewHeightSizable)];
+
+			NSTableView *tv = [[NSTableView alloc]
+				initWithFrame:[[sc contentView] bounds]];
+			for (NSDictionary *cd in colDefs)
+			{
+				NSTableColumn *tc = [[NSTableColumn alloc]
+					initWithIdentifier:cd[@"id"]];
+				[tc setTitle:cd[@"title"]];
+				[tc setEditable:YES];
+				[tc setWidth:[cd[@"w"] floatValue]];
+				[tv addTableColumn:tc];
+			}
+			[tv setHeaderView:([colDefs count] > 1) ? [tv headerView] : nil];
+			[tv setRowHeight:18];
+			[tv setDataSource:(id<NSTableViewDataSource>)ds];
+			[tv setDelegate:(id<NSTableViewDelegate>)ds];
+
+			[sc setDocumentView:tv];
+			[v addSubview:sc];
+
+			[item setView:v];
+			[editTabView addTabViewItem:item];
+			return tv;
+		};
+
+		/* Create data sources. */
+		editServerDS = [[HCEditServerDS alloc] init];
+		editChanDS   = [[HCEditChanDS alloc] init];
+		editCmdDS    = [[HCEditCmdDS alloc] init];
+
+		/* Servers tab. */
+		editServerTable = makeTab (@"Servers", @"servers",
+			@[ @{ @"id": @"server", @"title": @"Server",
+				  @"w": @(300) } ],
+			editServerDS,
+			@selector(editAddServer:), @selector(editRemoveServer:));
+
+		/* Autojoin channels tab. */
+		editChanTable = makeTab (@"Autojoin channels", @"channels",
+			@[ @{ @"id": @"chan", @"title": @"Channel", @"w": @(180) },
+			   @{ @"id": @"key",  @"title": @"Key (Password)",
+				  @"w": @(100) } ],
+			editChanDS,
+			@selector(editAddChannel:), @selector(editRemoveChannel:));
+
+		/* Connect commands tab. */
+		editCmdTable = makeTab (@"Connect commands", @"commands",
+			@[ @{ @"id": @"cmd", @"title": @"Command",
+				  @"w": @(300) } ],
+			editCmdDS,
+			@selector(editAddCommand:), @selector(editRemoveCommand:));
+
+		[content addSubview:editTabView];
+
+		/* ==============================================================
+		 *  Checkboxes
+		 * ============================================================== */
+		struct {
+			const char *label;
+			int flag;
+			int reversed;  /* 1 = checked means flag is OFF */
+		} chks[] = {
+			{ "Connect to selected server only",             1,  1 },
+			{ "Connect to this network automatically",       8,  0 },
+			{ "Bypass proxy server",                         16, 1 },
+			{ "Use SSL for all the servers on this network", 4,  0 },
+			{ "Accept invalid SSL certificates",             32, 0 },
+			{ "Use global user information",                 2,  0 },
+		};
+
+		y -= 10;
+		for (int i = 0; i < 6; i++)
+		{
+			y -= 22;
+			NSString *lbl = [NSString stringWithUTF8String:chks[i].label];
+			NSButton *chk = [NSButton checkboxWithTitle:lbl
+				target:menuTarget action:@selector(editCheckboxToggled:)];
+			[chk setFrame:NSMakeRect (14, y, W - 28, 18)];
+			[chk setTag:(chks[i].flag | (chks[i].reversed ? 0x10000 : 0))];
+			[chk setAutoresizingMask:NSViewMaxXMargin];
+
+			/* Compute initial state. */
+			BOOL on;
+			if (chks[i].reversed)
+				on = !(net->flags & chks[i].flag);
+			else
+				on = !!(net->flags & chks[i].flag);
+			[chk setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+
+			[content addSubview:chk];
+
+			if (chks[i].flag == 2)  /* FLAG_USE_GLOBAL */
+				editChkGlobal = chk;
+		}
+
+		/* ==============================================================
+		 *  Text fields: nick, nick2, real, user, login, pass, charset
+		 * ============================================================== */
+		struct {
+			const char *label;
+			const char *value;
+			int secure;     /* 1 = password field */
+		} fields[] = {
+			{ "Nick name:",     net->nick,  0 },
+			{ "Second choice:", net->nick2, 0 },
+			{ "Real name:",     net->real,  0 },
+			{ "User name:",     net->user,  0 },
+		};
+
+		y -= 8;
+		NSTextField *textFields[4];
+		for (int i = 0; i < 4; i++)
+		{
+			y -= 26;
+			NSTextField *lbl = [NSTextField labelWithString:
+				[NSString stringWithUTF8String:fields[i].label]];
+			[lbl setFrame:NSMakeRect (14, y + 2, 110, 18)];
+			[lbl setAlignment:NSTextAlignmentRight];
+			[lbl setFont:[NSFont systemFontOfSize:12]];
+			[lbl setAutoresizingMask:NSViewMinYMargin];
+			[content addSubview:lbl];
+
+			NSTextField *tf = [[NSTextField alloc]
+				initWithFrame:NSMakeRect (130, y, W - 150, 22)];
+			NSString *val = fields[i].value
+				? [NSString stringWithUTF8String:fields[i].value] : @"";
+			[tf setStringValue:val ?: @""];
+			[tf setFont:[NSFont systemFontOfSize:12]];
+			[tf setAutoresizingMask:
+				(NSViewWidthSizable | NSViewMinYMargin)];
+			[content addSubview:tf];
+			textFields[i] = tf;
+		}
+		editNickField  = textFields[0];
+		editNick2Field = textFields[1];
+		editRealField  = textFields[2];
+		editUserField  = textFields[3];
+		editFieldsToToggle[0] = editNickField;
+		editFieldsToToggle[1] = editNick2Field;
+		editFieldsToToggle[2] = editRealField;
+		editFieldsToToggle[3] = editUserField;
+
+		/* Login method popup. */
+		y -= 26;
+		{
+			NSTextField *lbl = [NSTextField labelWithString:@"Login method:"];
+			[lbl setFrame:NSMakeRect (14, y + 2, 110, 18)];
+			[lbl setAlignment:NSTextAlignmentRight];
+			[lbl setFont:[NSFont systemFontOfSize:12]];
+			[lbl setAutoresizingMask:NSViewMinYMargin];
+			[content addSubview:lbl];
+
+			editLoginPopup = [[NSPopUpButton alloc]
+				initWithFrame:NSMakeRect (130, y - 2, W - 150, 26)
+				pullsDown:NO];
+			NSArray *loginNames = @[
+				@"Default",
+				@"SASL PLAIN (username + password)",
+				@"SASL EXTERNAL (cert)",
+				@"SASL SCRAM-SHA-1",
+				@"SASL SCRAM-SHA-256",
+				@"SASL SCRAM-SHA-512",
+				@"Server password (/PASS password)",
+				@"NickServ (/MSG NickServ + password)",
+				@"NickServ (/NICKSERV + password)",
+				@"Challenge Auth (username + password)",
+				@"Custom... (connect commands)",
+			];
+			for (NSString *n in loginNames)
+				[editLoginPopup addItemWithTitle:n];
+			[editLoginPopup selectItemAtIndex:
+				login_conf_to_popup_index (net->logintype)];
+			[editLoginPopup setFont:[NSFont systemFontOfSize:12]];
+			[editLoginPopup setAutoresizingMask:
+				(NSViewWidthSizable | NSViewMinYMargin)];
+			[content addSubview:editLoginPopup];
+		}
+
+		/* Password. */
+		y -= 26;
+		{
+			NSTextField *lbl = [NSTextField labelWithString:@"Password:"];
+			[lbl setFrame:NSMakeRect (14, y + 2, 110, 18)];
+			[lbl setAlignment:NSTextAlignmentRight];
+			[lbl setFont:[NSFont systemFontOfSize:12]];
+			[lbl setAutoresizingMask:NSViewMinYMargin];
+			[content addSubview:lbl];
+
+			editPassField = [[NSSecureTextField alloc]
+				initWithFrame:NSMakeRect (130, y, W - 150, 22)];
+			NSString *pw = net->pass
+				? [NSString stringWithUTF8String:net->pass] : @"";
+			[editPassField setStringValue:pw ?: @""];
+			[editPassField setFont:[NSFont systemFontOfSize:12]];
+			[editPassField setAutoresizingMask:
+				(NSViewWidthSizable | NSViewMinYMargin)];
+			[content addSubview:editPassField];
+		}
+
+		/* Character set combo. */
+		y -= 28;
+		{
+			NSTextField *lbl = [NSTextField labelWithString:@"Character set:"];
+			[lbl setFrame:NSMakeRect (14, y + 2, 110, 18)];
+			[lbl setAlignment:NSTextAlignmentRight];
+			[lbl setFont:[NSFont systemFontOfSize:12]];
+			[lbl setAutoresizingMask:NSViewMinYMargin];
+			[content addSubview:lbl];
+
+			editCharsetCombo = [[NSComboBox alloc]
+				initWithFrame:NSMakeRect (130, y, W - 150, 24)];
+			for (int i = 0; cocoa_charsets[i]; i++)
+				[editCharsetCombo addItemWithObjectValue:
+					[NSString stringWithUTF8String:cocoa_charsets[i]]];
+			NSString *enc = (net->encoding && net->encoding[0])
+				? [NSString stringWithUTF8String:net->encoding]
+				: @"UTF-8 (Unicode)";
+			[editCharsetCombo setStringValue:enc ?: @"UTF-8 (Unicode)"];
+			[editCharsetCombo setEditable:YES];
+			[editCharsetCombo setFont:[NSFont systemFontOfSize:12]];
+			[editCharsetCombo setAutoresizingMask:
+				(NSViewWidthSizable | NSViewMinYMargin)];
+			[content addSubview:editCharsetCombo];
+		}
+
+		/* ==============================================================
+		 *  Close button
+		 * ============================================================== */
+		NSButton *closeBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (W - 94, 10, 80, 32)];
+		[closeBtn setTitle:@"Close"];
+		[closeBtn setBezelStyle:NSBezelStyleRounded];
+		[closeBtn setTarget:menuTarget];
+		[closeBtn setAction:@selector(editClose:)];
+		[closeBtn setKeyEquivalent:@"\r"];
+		[closeBtn setAutoresizingMask:
+			(NSViewMinXMargin | NSViewMaxYMargin)];
+		[content addSubview:closeBtn];
+
+		/* Apply "Use global" state to fields. */
+		edit_toggle_global_fields ();
+
+		[editNetWindow makeKeyAndOrderFront:nil];
+	}
+}
+
+/* ---------- Toggle nick/user field enabled state ---------- */
+static void
+edit_toggle_global_fields (void)
+{
+	if (!editChkGlobal) return;
+	BOOL global = ([editChkGlobal state] == NSControlStateValueOn);
+	for (int i = 0; i < 4; i++)
+	{
+		[editFieldsToToggle[i] setEditable:!global];
+		[editFieldsToToggle[i] setEnabled:!global];
+	}
+}
+
+/* ---------- Save fields back to ircnet ---------- */
+static void
+edit_save_fields (void)
+{
+	if (!editNet) return;
+
+	/* Nick/user/real/pass — only save if "Use global" is off. */
+	if (!([editChkGlobal state] == NSControlStateValueOn))
+	{
+		const char *v;
+
+		v = [[editNickField stringValue] UTF8String];
+		g_free (editNet->nick);
+		editNet->nick = (v && v[0]) ? g_strdup (v) : NULL;
+
+		v = [[editNick2Field stringValue] UTF8String];
+		g_free (editNet->nick2);
+		editNet->nick2 = (v && v[0]) ? g_strdup (v) : NULL;
+
+		v = [[editRealField stringValue] UTF8String];
+		g_free (editNet->real);
+		editNet->real = (v && v[0]) ? g_strdup (v) : NULL;
+
+		v = [[editUserField stringValue] UTF8String];
+		g_free (editNet->user);
+		editNet->user = (v && v[0]) ? g_strdup (v) : NULL;
+	}
+
+	/* Password (always save). */
+	const char *pw = [[editPassField stringValue] UTF8String];
+	g_free (editNet->pass);
+	editNet->pass = (pw && pw[0]) ? g_strdup (pw) : NULL;
+
+	/* Login type. */
+	NSInteger idx = [editLoginPopup indexOfSelectedItem];
+	if (idx >= 0 && idx < cocoa_login_types_count)
+		editNet->logintype = cocoa_login_types_conf[idx];
+
+	/* Charset. */
+	const char *cs = [[editCharsetCombo stringValue] UTF8String];
+	g_free (editNet->encoding);
+	editNet->encoding = (cs && cs[0]) ? g_strdup (cs) : NULL;
+}
+
+/* ---------- Edit dialog button actions ---------- */
+@implementation HCMenuTarget (EditNetwork)
+
+- (void)editClose:(id)sender
+{
+	edit_save_fields ();
+	[editNetWindow orderOut:nil];
+	editNetWindow = nil;
+	editNet = nil;
+	editServerTable = editChanTable = editCmdTable = nil;
+	editNickField = editNick2Field = editRealField = editUserField = nil;
+	editPassField = nil;
+	editLoginPopup = nil;
+	editCharsetCombo = nil;
+	editChkGlobal = nil;
+	editServerDS = editChanDS = editCmdDS = nil;
+
+	/* Refresh server list table in case the name changed. */
+	if (serverListTable)
+		[serverListTable reloadData];
+}
+
+- (void)editCheckboxToggled:(id)sender
+{
+	if (!editNet) return;
+	NSInteger tag = [sender tag];
+	int flag = (int)(tag & 0xFFFF);
+	int reversed = (tag & 0x10000) ? 1 : 0;
+	BOOL checked = ([sender state] == NSControlStateValueOn);
+
+	if (reversed)
+		checked = !checked;
+
+	if (checked)
+		editNet->flags |= flag;
+	else
+		editNet->flags &= ~flag;
+
+	/* If FLAG_USE_GLOBAL toggled, enable/disable fields. */
+	if (flag == 2)
+		edit_toggle_global_fields ();
+}
+
+/* --- Servers tab --- */
+- (void)editAddServer:(id)sender
+{
+	if (!editNet) return;
+	servlist_server_add (editNet, "newserver/6667");
+	[editServerTable reloadData];
+	/* Select & edit the new row. */
+	NSInteger row = (NSInteger)g_slist_length (editNet->servlist) - 1;
+	if (row >= 0)
+	{
+		[editServerTable selectRowIndexes:
+			[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+		[editServerTable editColumn:0 row:row withEvent:nil select:YES];
+	}
+}
+
+- (void)editRemoveServer:(id)sender
+{
+	if (!editNet) return;
+	NSInteger row = [editServerTable selectedRow];
+	if (row < 0) return;
+	/* Keep at least one server. */
+	if (g_slist_length (editNet->servlist) < 2) return;
+	ircserver *s = g_slist_nth_data (editNet->servlist, (guint)row);
+	if (s) servlist_server_remove (editNet, s);
+	[editServerTable reloadData];
+}
+
+/* --- Channels tab --- */
+- (void)editAddChannel:(id)sender
+{
+	if (!editNet) return;
+	servlist_favchan_add (editNet, "#channel");
+	[editChanTable reloadData];
+	NSInteger row = (NSInteger)g_slist_length (editNet->favchanlist) - 1;
+	if (row >= 0)
+	{
+		[editChanTable selectRowIndexes:
+			[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+		[editChanTable editColumn:0 row:row withEvent:nil select:YES];
+	}
+}
+
+- (void)editRemoveChannel:(id)sender
+{
+	if (!editNet) return;
+	NSInteger row = [editChanTable selectedRow];
+	if (row < 0) return;
+	favchannel *fc = g_slist_nth_data (editNet->favchanlist, (guint)row);
+	if (fc) servlist_favchan_remove (editNet, fc);
+	[editChanTable reloadData];
+}
+
+/* --- Commands tab --- */
+- (void)editAddCommand:(id)sender
+{
+	if (!editNet) return;
+	servlist_command_add (editNet, "ECHO hello");
+	[editCmdTable reloadData];
+	NSInteger row = (NSInteger)g_slist_length (editNet->commandlist) - 1;
+	if (row >= 0)
+	{
+		[editCmdTable selectRowIndexes:
+			[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+		[editCmdTable editColumn:0 row:row withEvent:nil select:YES];
+	}
+}
+
+- (void)editRemoveCommand:(id)sender
+{
+	if (!editNet) return;
+	NSInteger row = [editCmdTable selectedRow];
+	if (row < 0) return;
+	commandentry *e = g_slist_nth_data (editNet->commandlist, (guint)row);
+	if (e) servlist_command_remove (editNet, e);
+	[editCmdTable reloadData];
 }
 
 @end
