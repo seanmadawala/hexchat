@@ -196,8 +196,12 @@ static NSInteger       completionStart;    /* Character position of the word  */
 /* --- Feature 5: Server List panel --- */
 static NSWindow      *serverListWindow;
 static NSTableView   *serverListTable;
-static NSMutableArray *serverListNets;     /* Array of ircnet * (wrapped)     */
+static NSMutableArray *serverListNets;     /* Array of NSValue<ircnet *>      */
 static id             serverListDataSource;
+static NSTextField   *slNickField1;        /* Server list nick/user fields    */
+static NSTextField   *slNickField2;
+static NSTextField   *slNickField3;
+static NSTextField   *slUserField;
 
 /* --- Feature 6: DCC panel --- */
 static NSWindow      *dccWindow;
@@ -637,7 +641,7 @@ doCommandBySelector:(SEL)commandSelector
 
 
 /* ==========================================================================
- *  FEATURE 5 — HCServerListDataSource
+ *  FEATURE 5 — HCServerListDataSource (view-based for bold favorites)
  * ==========================================================================
  */
 
@@ -652,16 +656,44 @@ doCommandBySelector:(SEL)commandSelector
 	return serverListNets ? (NSInteger)[serverListNets count] : 0;
 }
 
-- (id)tableView:(NSTableView *)tableView
-	objectValueForTableColumn:(NSTableColumn *)tableColumn
+- (NSView *)tableView:(NSTableView *)tableView
+	viewForTableColumn:(NSTableColumn *)tableColumn
 	row:(NSInteger)row
 {
+	NSTableCellView *cell =
+		[tableView makeViewWithIdentifier:@"NetworkCell" owner:self];
+	if (!cell)
+	{
+		cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, 300, 24)];
+		NSTextField *tf = [NSTextField labelWithString:@""];
+		[tf setIdentifier:@"label"];
+		[tf setFrame:[cell bounds]];
+		[tf setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+		[cell addSubview:tf];
+		[cell setTextField:tf];
+		[cell setIdentifier:@"NetworkCell"];
+	}
+
 	if (!serverListNets || row < 0 || row >= (NSInteger)[serverListNets count])
-		return @"";
+	{
+		[[cell textField] setStringValue:@""];
+		return cell;
+	}
 
 	ircnet *net = [serverListNets[row] pointerValue];
-	if (!net || !net->name) return @"???";
-	return [NSString stringWithUTF8String:net->name];
+	NSString *name = (net && net->name)
+		? [NSString stringWithUTF8String:net->name] : @"???";
+	if (!name) name = @"???";
+
+	/* Bold for favorites. */
+	NSFont *font = (net && (net->flags & FLAG_FAVORITE))
+		? [NSFont boldSystemFontOfSize:13]
+		: [NSFont systemFontOfSize:13];
+	NSDictionary *attrs = @{ NSFontAttributeName : font };
+	[[cell textField] setAttributedStringValue:
+		[[NSAttributedString alloc] initWithString:name attributes:attrs]];
+
+	return cell;
 }
 
 @end
@@ -1168,6 +1200,66 @@ rebuild_user_list_data (struct session *sess)
  * ==========================================================================
  */
 
+/* Helper: rebuild serverListNets from network_list, respecting favorites. */
+static void
+populate_server_list_nets (void)
+{
+	[serverListNets removeAllObjects];
+	GSList *sl;
+	int i = 0;
+	for (sl = network_list; sl; sl = sl->next, i++)
+	{
+		ircnet *net = sl->data;
+		if (!net) continue;
+		if (prefs.hex_gui_slist_fav && !(net->flags & FLAG_FAVORITE))
+			continue;
+		[serverListNets addObject:[NSValue valueWithPointer:net]];
+	}
+}
+
+/* Helper: save nick/user fields from the server list dialog to prefs. */
+static int
+servlist_save_fields (void)
+{
+	if (!slNickField1) return 0;
+
+	const char *user = [[slUserField stringValue] UTF8String];
+	if (!user || user[0] == 0)
+		return 1;   /* blank username not allowed */
+
+	const char *n1 = [[slNickField1 stringValue] UTF8String];
+	const char *n2 = [[slNickField2 stringValue] UTF8String];
+	const char *n3 = [[slNickField3 stringValue] UTF8String];
+
+	if (n1) safe_strcpy (prefs.hex_irc_nick1, n1, sizeof (prefs.hex_irc_nick1));
+	if (n2) safe_strcpy (prefs.hex_irc_nick2, n2, sizeof (prefs.hex_irc_nick2));
+	if (n3) safe_strcpy (prefs.hex_irc_nick3, n3, sizeof (prefs.hex_irc_nick3));
+	if (user)
+	{
+		safe_strcpy (prefs.hex_irc_user_name, user,
+			sizeof (prefs.hex_irc_user_name));
+		/* Strip spaces — they break IRC login. */
+		char *sp = strchr (prefs.hex_irc_user_name, ' ');
+		if (sp) *sp = 0;
+	}
+
+	servlist_save ();
+	save_config ();
+	return 0;
+}
+
+/* Helper: compare function for sorting networks. */
+static gint
+cocoa_servlist_compare (ircnet *a, ircnet *b)
+{
+	gchar *af = g_utf8_casefold (a->name, -1);
+	gchar *bf = g_utf8_casefold (b->name, -1);
+	int r = g_utf8_collate (af, bf);
+	g_free (af);
+	g_free (bf);
+	return r;
+}
+
 static void
 show_server_list (void)
 {
@@ -1179,47 +1271,114 @@ show_server_list (void)
 			return;
 		}
 
-		/* Build the network list from HexChat's global network_list. */
+		/* Build the network array. */
 		serverListNets = [[NSMutableArray alloc] init];
-		GSList *sl;
-		for (sl = network_list; sl; sl = sl->next)
-		{
-			ircnet *net = sl->data;
-			if (net)
-				[serverListNets addObject:[NSValue valueWithPointer:net]];
-		}
+		populate_server_list_nets ();
 
-		/* Create the window. */
-		NSRect frame = NSMakeRect (200, 200, 400, 500);
+		/* --- Window --- */
+		NSRect frame = NSMakeRect (200, 150, 410, 530);
 		serverListWindow = [[NSWindow alloc]
 			initWithContentRect:frame
 			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 				| NSWindowStyleMaskResizable)
 			backing:NSBackingStoreBuffered
 			defer:NO];
-		[serverListWindow setTitle:@"Server List"];
-		[serverListWindow setMinSize:NSMakeSize(300, 300)];
+		[serverListWindow setTitle:@"Network List - HexChat"];
+		[serverListWindow setMinSize:NSMakeSize (380, 420)];
 
 		NSView *content = [serverListWindow contentView];
-		NSRect bounds = [content bounds];
+		CGFloat W = [content bounds].size.width;
+		CGFloat y = [content bounds].size.height;   /* build top-down */
 
-		/* Connect button (bottom). */
-		NSButton *connectBtn = [[NSButton alloc]
-			initWithFrame:NSMakeRect (bounds.size.width - 110, 10, 100, 32)];
-		[connectBtn setTitle:@"Connect"];
-		[connectBtn setBezelStyle:NSBezelStyleRounded];
-		[connectBtn setTarget:menuTarget];
-		[connectBtn setAction:@selector(connectFromServerList:)];
-		[connectBtn setAutoresizingMask:
-			(NSViewMinXMargin | NSViewMaxYMargin)];
-		[content addSubview:connectBtn];
+		/* ============================================================
+		 *  User Information section
+		 * ============================================================ */
+		y -= 24;
+		NSTextField *userInfoLabel = [NSTextField labelWithString:
+			@"User Information"];
+		[userInfoLabel setFont:[NSFont boldSystemFontOfSize:12]];
+		[userInfoLabel setFrame:NSMakeRect (14, y, 200, 18)];
+		[userInfoLabel setAutoresizingMask:NSViewMinYMargin];
+		[content addSubview:userInfoLabel];
 
-		/* Table view. */
-		NSRect tableFrame = NSMakeRect (0, 50, bounds.size.width,
-			bounds.size.height - 50);
+		/* Nick / user name fields — 4 rows. */
+		NSArray *labels = @[ @"Nick name:", @"Second choice:",
+							 @"Third choice:", @"User name:" ];
+		const char *vals[] = {
+			prefs.hex_irc_nick1, prefs.hex_irc_nick2,
+			prefs.hex_irc_nick3, prefs.hex_irc_user_name
+		};
+		NSTextField *fields[4];
+
+		for (int i = 0; i < 4; i++)
+		{
+			y -= 28;
+			NSTextField *lbl = [NSTextField labelWithString:labels[i]];
+			[lbl setFrame:NSMakeRect (20, y + 2, 110, 18)];
+			[lbl setAlignment:NSTextAlignmentRight];
+			[lbl setFont:[NSFont systemFontOfSize:12]];
+			[lbl setAutoresizingMask:NSViewMinYMargin];
+			[content addSubview:lbl];
+
+			NSTextField *tf = [[NSTextField alloc]
+				initWithFrame:NSMakeRect (136, y, W - 156, 22)];
+			NSString *v = vals[i]
+				? [NSString stringWithUTF8String:vals[i]] : @"";
+			[tf setStringValue:v ?: @""];
+			[tf setFont:[NSFont systemFontOfSize:12]];
+			[tf setAutoresizingMask:
+				(NSViewWidthSizable | NSViewMinYMargin)];
+			[content addSubview:tf];
+			fields[i] = tf;
+		}
+
+		slNickField1 = fields[0];
+		slNickField2 = fields[1];
+		slNickField3 = fields[2];
+		slUserField  = fields[3];
+
+		/* ============================================================
+		 *  Networks section
+		 * ============================================================ */
+		y -= 30;
+		NSTextField *netsLabel = [NSTextField labelWithString:@"Networks"];
+		[netsLabel setFont:[NSFont boldSystemFontOfSize:12]];
+		[netsLabel setFrame:NSMakeRect (14, y, 200, 18)];
+		[netsLabel setAutoresizingMask:NSViewMinYMargin];
+		[content addSubview:netsLabel];
+
+		/* Buttons on the right. */
+		CGFloat btnW = 80, btnH = 28, btnX = W - btnW - 14;
+		CGFloat btnTop = y - 6;
+		NSArray *btnTitles = @[ @"Add", @"Remove", @"Edit\xE2\x80\xA6",
+								@"Sort", @"Favor" ];
+		SEL btnActions[] = {
+			@selector(slAdd:), @selector(slRemove:),
+			@selector(slEdit:), @selector(slSort:),
+			@selector(slFavor:)
+		};
+		for (int i = 0; i < 5; i++)
+		{
+			NSButton *btn = [[NSButton alloc]
+				initWithFrame:NSMakeRect (btnX, btnTop - i * (btnH + 4),
+					btnW, btnH)];
+			[btn setTitle:btnTitles[i]];
+			[btn setBezelStyle:NSBezelStyleRounded];
+			[btn setTarget:menuTarget];
+			[btn setAction:btnActions[i]];
+			[btn setAutoresizingMask:
+				(NSViewMinXMargin | NSViewMinYMargin)];
+			[content addSubview:btn];
+		}
+
+		/* Network table (left of buttons). */
+		CGFloat tableTop = y - 6;
+		CGFloat tableH = 5 * (btnH + 4) + 20;  /* tall enough for buttons */
+		CGFloat tableW = btnX - 24;
 		NSScrollView *scroll = [[NSScrollView alloc]
-			initWithFrame:tableFrame];
+			initWithFrame:NSMakeRect (14, tableTop - tableH, tableW, tableH)];
 		[scroll setHasVerticalScroller:YES];
+		[scroll setBorderType:NSBezelBorder];
 		[scroll setAutoresizingMask:
 			(NSViewWidthSizable | NSViewHeightSizable)];
 
@@ -1227,10 +1386,10 @@ show_server_list (void)
 			initWithFrame:[[scroll contentView] bounds]];
 		NSTableColumn *col = [[NSTableColumn alloc]
 			initWithIdentifier:@"network"];
-		[col setWidth:380];
-		[col setTitle:@"Network"];
+		[col setWidth:tableW - 20];
 		[serverListTable addTableColumn:col];
 		[serverListTable setHeaderView:nil];
+		[serverListTable setRowHeight:20];
 
 		serverListDataSource = [[HCServerListDataSource alloc] init];
 		[serverListTable setDataSource:
@@ -1243,12 +1402,73 @@ show_server_list (void)
 		[scroll setDocumentView:serverListTable];
 		[content addSubview:scroll];
 
+		y = tableTop - tableH;
+
+		/* ============================================================
+		 *  Checkboxes
+		 * ============================================================ */
+		y -= 6;
+		NSButton *skipChk = [NSButton checkboxWithTitle:
+			@"Skip network list on startup"
+			target:menuTarget action:@selector(slSkipToggled:)];
+		[skipChk setFrame:NSMakeRect (14, y - 20, 220, 18)];
+		[skipChk setState:prefs.hex_gui_slist_skip
+			? NSControlStateValueOn : NSControlStateValueOff];
+		[skipChk setAutoresizingMask:NSViewMaxXMargin];
+		[content addSubview:skipChk];
+
+		NSButton *favChk = [NSButton checkboxWithTitle:
+			@"Show favorites only"
+			target:menuTarget action:@selector(slFavToggled:)];
+		[favChk setFrame:NSMakeRect (242, y - 20, 160, 18)];
+		[favChk setState:prefs.hex_gui_slist_fav
+			? NSControlStateValueOn : NSControlStateValueOff];
+		[favChk setAutoresizingMask:NSViewMaxXMargin];
+		[content addSubview:favChk];
+
+		y -= 26;
+
+		/* ============================================================
+		 *  Close / Connect buttons (bottom)
+		 * ============================================================ */
+		NSButton *closeBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (14, 10, 80, 32)];
+		[closeBtn setTitle:@"Close"];
+		[closeBtn setBezelStyle:NSBezelStyleRounded];
+		[closeBtn setTarget:menuTarget];
+		[closeBtn setAction:@selector(slClose:)];
+		[closeBtn setAutoresizingMask:
+			(NSViewMaxXMargin | NSViewMaxYMargin)];
+		[content addSubview:closeBtn];
+
+		NSButton *connectBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (W - 94, 10, 80, 32)];
+		[connectBtn setTitle:@"Connect"];
+		[connectBtn setBezelStyle:NSBezelStyleRounded];
+		[connectBtn setTarget:menuTarget];
+		[connectBtn setAction:@selector(connectFromServerList:)];
+		[connectBtn setAutoresizingMask:
+			(NSViewMinXMargin | NSViewMaxYMargin)];
+		[connectBtn setKeyEquivalent:@"\r"];  /* default button */
+		[content addSubview:connectBtn];
+
+		/* Restore previous selection. */
+		if (prefs.hex_gui_slist_select >= 0 &&
+			prefs.hex_gui_slist_select < (int)[serverListNets count])
+		{
+			NSIndexSet *idx = [NSIndexSet
+				indexSetWithIndex:prefs.hex_gui_slist_select];
+			[serverListTable selectRowIndexes:idx byExtendingSelection:NO];
+			[serverListTable scrollRowToVisible:prefs.hex_gui_slist_select];
+		}
+
 		[serverListWindow makeKeyAndOrderFront:nil];
 	}
 }
 
-/* Connect action for server list. */
+/* Server list button actions. */
 @implementation HCMenuTarget (ServerList)
+
 - (void)connectFromServerList:(id)sender
 {
 	NSInteger row = [serverListTable selectedRow];
@@ -1259,16 +1479,186 @@ show_server_list (void)
 	ircnet *net = [serverListNets[row] pointerValue];
 	if (!net) return;
 
+	/* Save nick/user fields to prefs before connecting. */
+	if (servlist_save_fields () == 1)
+	{
+		NSAlert *a = [[NSAlert alloc] init];
+		[a setMessageText:@"User name cannot be left blank."];
+		[a runModal];
+		return;
+	}
+
+	/* Remember selection. */
+	prefs.hex_gui_slist_select = (int)row;
+
 	/* Close the dialog. */
 	[serverListWindow orderOut:nil];
+	serverListWindow = nil;
+	slNickField1 = slNickField2 = slNickField3 = slUserField = nil;
 
-	/* Connect using the first available session. */
-	struct session *sess = current_sess;
-	if (!sess && sess_list)
-		sess = sess_list->data;
-	if (sess)
-		servlist_connect (sess, net, TRUE);
+	/*
+	 * Match GTK frontend logic:
+	 * - Look for an existing session already on this network
+	 * - If that session's server is already connected, pass NULL
+	 *   so servlist_connect() creates a new window
+	 * - Otherwise reuse an idle/unconnected session
+	 */
+	struct session *chosen = current_sess;
+	struct session *use_sess = NULL;
+
+	GSList *list;
+	for (list = sess_list; list; list = list->next)
+	{
+		struct session *s = list->data;
+		if (s->server->network == net)
+		{
+			use_sess = s;
+			if (s->server->connected)
+				use_sess = NULL;
+			break;
+		}
+	}
+
+	if (!use_sess && chosen &&
+		!chosen->server->connected &&
+		chosen->server->server_session->channel[0] == 0)
+	{
+		use_sess = chosen;
+	}
+
+	servlist_connect (use_sess, net, TRUE);
 }
+
+- (void)slClose:(id)sender
+{
+	servlist_save_fields ();
+
+	/* Remember selection. */
+	NSInteger row = [serverListTable selectedRow];
+	if (row >= 0)
+		prefs.hex_gui_slist_select = (int)row;
+
+	[serverListWindow orderOut:nil];
+	serverListWindow = nil;
+	slNickField1 = slNickField2 = slNickField3 = slUserField = nil;
+
+	/* If no sessions exist at all (fresh launch, user closed dialog),
+	   exit the application just like the GTK frontend. */
+	if (sess_list == NULL)
+		hexchat_exit ();
+}
+
+- (void)slAdd:(id)sender
+{
+	ircnet *net = servlist_net_add ("New Network", "", TRUE);
+	if (!net) return;
+	net->encoding = g_strdup ("UTF-8 (Unicode)");
+	servlist_server_add (net, "newserver/6667");
+
+	populate_server_list_nets ();
+	[serverListTable reloadData];
+
+	/* Select the new network (it was prepended). */
+	if ([serverListNets count] > 0)
+	{
+		[serverListTable selectRowIndexes:
+			[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+		[serverListTable scrollRowToVisible:0];
+	}
+}
+
+- (void)slRemove:(id)sender
+{
+	NSInteger row = [serverListTable selectedRow];
+	if (row < 0 || !serverListNets ||
+		row >= (NSInteger)[serverListNets count])
+		return;
+
+	ircnet *net = [serverListNets[row] pointerValue];
+	if (!net) return;
+
+	NSString *name = net->name
+		? [NSString stringWithUTF8String:net->name] : @"network";
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:
+		[NSString stringWithFormat:@"Remove network \"%@\"?", name]];
+	[alert addButtonWithTitle:@"Remove"];
+	[alert addButtonWithTitle:@"Cancel"];
+	if ([alert runModal] != NSAlertFirstButtonReturn)
+		return;
+
+	servlist_net_remove (net);
+	populate_server_list_nets ();
+	[serverListTable reloadData];
+
+	/* Select something nearby. */
+	NSInteger newCount = (NSInteger)[serverListNets count];
+	if (newCount > 0)
+	{
+		NSInteger sel = (row < newCount) ? row : newCount - 1;
+		[serverListTable selectRowIndexes:
+			[NSIndexSet indexSetWithIndex:sel] byExtendingSelection:NO];
+	}
+}
+
+- (void)slEdit:(id)sender
+{
+	NSAlert *a = [[NSAlert alloc] init];
+	[a setMessageText:@"Network editing is not yet implemented in the "
+		"Cocoa frontend. You can edit networks in the servlist.conf file."];
+	[a runModal];
+}
+
+- (void)slSort:(id)sender
+{
+	network_list = g_slist_sort (network_list,
+		(GCompareFunc)cocoa_servlist_compare);
+	populate_server_list_nets ();
+	[serverListTable reloadData];
+}
+
+- (void)slFavor:(id)sender
+{
+	NSInteger row = [serverListTable selectedRow];
+	if (row < 0 || !serverListNets ||
+		row >= (NSInteger)[serverListNets count])
+		return;
+
+	ircnet *net = [serverListNets[row] pointerValue];
+	if (!net) return;
+
+	net->flags ^= FLAG_FAVORITE;   /* toggle */
+
+	/* If "Show favorites only" is on and we just unfavorited,
+	   the row will vanish — repopulate. */
+	if (prefs.hex_gui_slist_fav)
+	{
+		populate_server_list_nets ();
+		[serverListTable reloadData];
+	}
+	else
+	{
+		/* Just refresh the single row for bold toggle. */
+		[serverListTable reloadDataForRowIndexes:
+			[NSIndexSet indexSetWithIndex:row]
+			columnIndexes:[NSIndexSet indexSetWithIndex:0]];
+	}
+}
+
+- (void)slSkipToggled:(id)sender
+{
+	prefs.hex_gui_slist_skip =
+		([sender state] == NSControlStateValueOn) ? 1 : 0;
+}
+
+- (void)slFavToggled:(id)sender
+{
+	prefs.hex_gui_slist_fav =
+		([sender state] == NSControlStateValueOn) ? 1 : 0;
+	populate_server_list_nets ();
+	[serverListTable reloadData];
+}
+
 @end
 
 
@@ -1885,19 +2275,25 @@ fe_set_topic (struct session *sess, char *topic, char *stripped_topic)
 
 	if (sess == current_sess)
 	{
+		/* Copy strings before dispatching — originals may be freed. */
+		NSString *topicStr = [NSString stringWithUTF8String:stripped_topic];
+		if (!topicStr) topicStr = @"";
+		NSString *chanStr = sess->channel[0]
+			? [NSString stringWithUTF8String:sess->channel] : nil;
+
 		dispatch_async (dispatch_get_main_queue (), ^{
 			if (topicBar)
-				[topicBar setStringValue:
-					[NSString stringWithUTF8String:stripped_topic]];
+				[topicBar setStringValue:topicStr];
 
 			/* Also update window title. */
 			NSString *title;
-			if (sess->channel[0])
-				title = [NSString stringWithFormat:@"%s — %s",
-					sess->channel, stripped_topic];
+			if (chanStr)
+				title = [NSString stringWithFormat:@"%@ — %@",
+					chanStr, topicStr];
 			else
-				title = [NSString stringWithUTF8String:stripped_topic];
-			[mainWindow setTitle:title];
+				title = topicStr;
+			if (mainWindow)
+				[mainWindow setTitle:title ?: @"HexChat"];
 		});
 	}
 }
@@ -1908,10 +2304,11 @@ fe_set_title (struct session *sess)
 {
 	if (sess == current_sess && mainWindow)
 	{
+		NSString *t = sess->channel[0]
+			? [NSString stringWithUTF8String:sess->channel]
+			: @"HexChat";
+		if (!t) t = @"HexChat";
 		dispatch_async (dispatch_get_main_queue (), ^{
-			NSString *t = sess->channel[0]
-				? [NSString stringWithUTF8String:sess->channel]
-				: @"HexChat";
 			[mainWindow setTitle:t];
 		});
 	}
@@ -2025,9 +2422,10 @@ fe_set_inputbox_contents (struct session *sess, char *text)
 {
 	if (!inputField || !text) return;
 	if (sess != current_sess) return;
+	NSString *str = [NSString stringWithUTF8String:text];
+	if (!str) str = @"";
 	dispatch_async (dispatch_get_main_queue (), ^{
-		[inputField setStringValue:
-			[NSString stringWithUTF8String:text]];
+		[inputField setStringValue:str];
 	});
 }
 
@@ -2061,10 +2459,12 @@ fe_confirm (const char *message, void (*yesproc)(void *),
             void (*noproc)(void *), void *ud)
 {
 	if (!message) return;
+	NSString *msg = [NSString stringWithUTF8String:message];
+	if (!msg) msg = @"Confirm?";
 	dispatch_async (dispatch_get_main_queue (), ^{
 		@autoreleasepool {
 			NSAlert *alert = [[NSAlert alloc] init];
-			[alert setMessageText:[NSString stringWithUTF8String:message]];
+			[alert setMessageText:msg];
 			[alert addButtonWithTitle:@"Yes"];
 			[alert addButtonWithTitle:@"No"];
 			if ([alert runModal] == NSAlertFirstButtonReturn)
@@ -2085,12 +2485,14 @@ fe_get_file (const char *title, char *initial,
              void (*callback)(void *userdata, char *file), void *userdata,
              int flags)
 {
+	NSString *titleStr = title
+		? [NSString stringWithUTF8String:title] : nil;
 	dispatch_async (dispatch_get_main_queue (), ^{
 		@autoreleasepool {
 			if (flags & FRF_WRITE)
 			{
 				NSSavePanel *p = [NSSavePanel savePanel];
-				if (title) [p setTitle:[NSString stringWithUTF8String:title]];
+				if (titleStr) [p setTitle:titleStr];
 				if ([p runModal] == NSModalResponseOK)
 				{
 					const char *path = [[[p URL] path] UTF8String];
@@ -2100,7 +2502,7 @@ fe_get_file (const char *title, char *initial,
 			else
 			{
 				NSOpenPanel *p = [NSOpenPanel openPanel];
-				if (title) [p setTitle:[NSString stringWithUTF8String:title]];
+				if (titleStr) [p setTitle:titleStr];
 				[p setAllowsMultipleSelection:(flags & FRF_MULTIPLE) ? YES : NO];
 				[p setCanChooseDirectories:(flags & FRF_CHOOSEFOLDER) ? YES : NO];
 				[p setCanChooseFiles:(flags & FRF_CHOOSEFOLDER) ? NO : YES];
