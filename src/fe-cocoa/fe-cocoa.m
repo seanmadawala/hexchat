@@ -859,7 +859,7 @@ create_main_window (void)
 		styleMask:style
 		backing:NSBackingStoreBuffered
 		defer:NO];
-	[mainWindow setTitle:@"HexChat"];
+	[mainWindow setTitle:@"MacChat"];
 	[mainWindow setMinSize:NSMakeSize(600, 400)];
 
 	NSView *content = [mainWindow contentView];
@@ -1052,8 +1052,10 @@ create_main_window (void)
 	[splitView setPosition:180 ofDividerAtIndex:0];
 	[splitView setPosition:(bounds.size.width - 160) ofDividerAtIndex:1];
 
-	/* Show the window. */
-	[mainWindow makeKeyAndOrderFront:nil];
+	/* Don't show the main window yet — the Network List is shown first.
+	   The main window becomes visible once the user connects to a server
+	   (via fe_ctrl_gui FE_GUI_SHOW / FE_GUI_FOCUS). */
+	[mainWindow orderOut:nil];
 	[mainWindow makeFirstResponder:inputField];
 }
 
@@ -1306,11 +1308,15 @@ static void show_stub_alert (NSString *feature)
 
 - (void)menuDisconnect:(id)sender
 {
+	if (!current_sess || !current_sess->server)
+		return;
 	handle_command (current_sess, "DISCON", FALSE);
 }
 
 - (void)menuReconnect:(id)sender
 {
+	if (!current_sess || !current_sess->server)
+		return;
 	handle_command (current_sess, "RECONNECT", FALSE);
 }
 
@@ -1350,6 +1356,8 @@ static void show_stub_alert (NSString *feature)
 
 - (void)menuAway:(id)sender
 {
+	if (!current_sess || !current_sess->server)
+		return;
 	if (current_sess->server->is_away)
 		handle_command (current_sess, "back", FALSE);
 	else
@@ -1401,12 +1409,13 @@ static void show_stub_alert (NSString *feature)
 - (void)menuAbout:(id)sender
 {
 	NSAlert *alert = [[NSAlert alloc] init];
-	[alert setMessageText:@"HexChat " PACKAGE_VERSION];
+	[alert setMessageText:@"MacChat " PACKAGE_VERSION];
 	[alert setInformativeText:
 		@"An IRC client for macOS.\n\n"
 		"Copyright \xC2\xA9 2026 Sean Madawala.\n"
 		"Based on HexChat by the HexChat team.\n\n"
-		"https://hexchat.github.io"];
+		"https://github.com/seanmadawala/hexchat\n"
+		""];
 	[alert setAlertStyle:NSAlertStyleInformational];
 	[alert addButtonWithTitle:@"OK"];
 	[alert runModal];
@@ -1453,9 +1462,9 @@ create_menu_bar (void)
 	 * ================================================================= */
 	NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
 	[menuBar addItem:appMenuItem];
-	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"HexChat"];
+	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"MacChat"];
 
-	[appMenu addItem:menu_item (@"About HexChat",
+	[appMenu addItem:menu_item (@"About MacChat",
 		@selector(menuAbout:), @"")];
 	[appMenu addItem:[NSMenuItem separatorItem]];
 
@@ -1473,7 +1482,7 @@ create_menu_bar (void)
 
 	[appMenu addItem:[NSMenuItem separatorItem]];
 
-	[appMenu addItemWithTitle:@"Hide HexChat"
+	[appMenu addItemWithTitle:@"Hide MacChat"
 		action:@selector(hide:) keyEquivalent:@"h"];
 
 	NSMenuItem *hideOthers = [appMenu addItemWithTitle:@"Hide Others"
@@ -1486,7 +1495,7 @@ create_menu_bar (void)
 
 	[appMenu addItem:[NSMenuItem separatorItem]];
 
-	[appMenu addItemWithTitle:@"Quit HexChat"
+	[appMenu addItemWithTitle:@"Quit MacChat"
 		action:@selector(terminate:) keyEquivalent:@"q"];
 
 	[appMenuItem setSubmenu:appMenu];
@@ -1672,7 +1681,7 @@ create_menu_bar (void)
 	[menuBar addItem:helpMenuItem];
 	NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
 
-	[helpMenu addItem:menu_item (@"HexChat Documentation",
+	[helpMenu addItem:menu_item (@"MacChat Documentation",
 		@selector(menuDocs:), @"")];
 
 	[helpMenuItem setSubmenu:helpMenu];
@@ -1725,7 +1734,7 @@ switch_to_session (struct session *sess)
 		/* Update window title. */
 		NSString *title = sess->channel[0]
 			? [NSString stringWithUTF8String:sess->channel]
-			: @"HexChat";
+			: @"MacChat";
 		[mainWindow setTitle:title];
 
 		/* Feature 3: Update topic bar. */
@@ -1936,14 +1945,15 @@ show_server_list (void)
 		populate_server_list_nets ();
 
 		/* --- Window --- */
-		NSRect frame = NSMakeRect (200, 150, 410, 530);
+		NSRect frame = NSMakeRect (0, 0, 410, 530);
 		serverListWindow = [[NSWindow alloc]
 			initWithContentRect:frame
 			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 				| NSWindowStyleMaskResizable)
 			backing:NSBackingStoreBuffered
 			defer:NO];
-		[serverListWindow setTitle:@"Network List - HexChat"];
+		[serverListWindow center];
+		[serverListWindow setTitle:@"Network List - MacChat"];
 		[serverListWindow setMinSize:NSMakeSize (380, 420)];
 
 		NSView *content = [serverListWindow contentView];
@@ -2191,6 +2201,9 @@ show_server_list (void)
 	}
 
 	servlist_connect (use_sess, net, TRUE);
+
+	/* Show the main window now that we're connecting. */
+	[mainWindow makeKeyAndOrderFront:nil];
 }
 
 - (void)slClose:(id)sender
@@ -2206,10 +2219,24 @@ show_server_list (void)
 	serverListWindow = nil;
 	slNickField1 = slNickField2 = slNickField3 = slUserField = nil;
 
-	/* If no sessions exist at all (fresh launch, user closed dialog),
-	   exit the application just like the GTK frontend. */
-	if (sess_list == NULL)
-		hexchat_exit ();
+	/* If no server is connected (fresh launch, user closed dialog),
+	   quit the application just like the GTK frontend. */
+	{
+		int any_connected = 0;
+		GSList *sl;
+		for (sl = sess_list; sl; sl = sl->next)
+		{
+			struct session *s = sl->data;
+			if (s->server && (s->server->connected ||
+				s->server->connecting))
+			{
+				any_connected = 1;
+				break;
+			}
+		}
+		if (!any_connected)
+			[NSApp terminate:nil];
+	}
 }
 
 - (void)slAdd:(id)sender
@@ -2512,7 +2539,7 @@ show_edit_network (ircnet *net)
 		editNet = net;
 
 		/* --- Window --- */
-		NSString *title = [NSString stringWithFormat:@"Edit %s - HexChat",
+		NSString *title = [NSString stringWithFormat:@"Edit %s - MacChat",
 			net->name ? net->name : "network"];
 		NSRect frame = NSMakeRect (250, 120, 480, 620);
 		editNetWindow = [[NSWindow alloc]
@@ -3272,6 +3299,9 @@ fe_init (void)
 	{
 		[NSApplication sharedApplication];
 
+		/* Set process name so macOS shows "MacChat" in the app menu. */
+		[[NSProcessInfo processInfo] setProcessName:@"MacChat"];
+
 		appDelegate = [[HCAppDelegate alloc] init];
 		[NSApp setDelegate:appDelegate];
 
@@ -3405,7 +3435,7 @@ fe_new_window (struct session *sess, int focus)
 		char buf[512];
 		g_snprintf (buf, sizeof (buf),
 			"\n"
-			" \017HexChat-Cocoa \00310" PACKAGE_VERSION "\n"
+			" \017MacChat \00310" PACKAGE_VERSION "\n"
 			" \017Running on \00310%s\n",
 			get_sys_str (1));
 		fe_print_text (sess, buf, 0, FALSE);
@@ -3732,7 +3762,7 @@ fe_set_topic (struct session *sess, char *topic, char *stripped_topic)
 			else
 				title = topicStr;
 			if (mainWindow)
-				[mainWindow setTitle:title ?: @"HexChat"];
+				[mainWindow setTitle:title ?: @"MacChat"];
 		});
 	}
 }
@@ -3745,8 +3775,8 @@ fe_set_title (struct session *sess)
 	{
 		NSString *t = sess->channel[0]
 			? [NSString stringWithUTF8String:sess->channel]
-			: @"HexChat";
-		if (!t) t = @"HexChat";
+			: @"MacChat";
+		if (!t) t = @"MacChat";
 		dispatch_async (dispatch_get_main_queue (), ^{
 			[mainWindow setTitle:t];
 		});

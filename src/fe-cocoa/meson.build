@@ -96,7 +96,7 @@ hexchat_cocoa_cflags = [
 #  We also need to pass the global C flags (warnings, etc.) to the
 #  Objective-C compiler since they aren't inherited automatically.
 # --------------------------------------------------------------------------
-executable('hexchat-cocoa',
+executable('MacChat',
   sources: hexchat_cocoa_sources,
   dependencies: hexchat_cocoa_deps,
   objc_args: hexchat_cocoa_cflags + global_cflags,

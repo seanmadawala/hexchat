@@ -29,7 +29,7 @@
 #ifndef HEXCHAT_FE_COCOA_H
 #define HEXCHAT_FE_COCOA_H
 
-#define DISPLAY_NAME "HexChat"
+#define DISPLAY_NAME "MacChat"
 
 /*
  * ==========================================================================
