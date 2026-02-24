@@ -74,6 +74,7 @@ static void init_mirc_colors (void);
 static void show_server_list (void);
 static void show_edit_network (ircnet *net);
 static void show_dcc_panel (void);
+static void show_preferences (void);
 
 /* Helper: get the NSTextStorage for a session. */
 static inline NSTextStorage *
@@ -270,6 +271,29 @@ static NSView        *findBar;
 static NSTextField   *findField;
 static BOOL           findBarVisible;
 static NSRange        lastFindRange;
+
+/* --- Preferences dialog --- */
+static NSWindow      *prefsWindow;
+static NSTabView     *prefsTabView;
+/* Text fields that must be read back on close: */
+static NSTextField   *prefsFontLabel;
+static NSTextField   *prefsStampFmt;
+static NSTextField   *prefsSpellLangs;
+static NSTextField   *prefsCompSuffix;
+static NSTextField   *prefsQuitMsg;
+static NSTextField   *prefsPartMsg;
+static NSTextField   *prefsAwayMsg;
+static NSTextField   *prefsRealName;
+static NSTextField   *prefsUlistDblClick;
+static NSTextField   *prefsHilightExtra;
+static NSTextField   *prefsHilightNoNick;
+static NSTextField   *prefsHilightNick;
+static NSTextField   *prefsLogMask;
+static NSTextField   *prefsLogStampFmt;
+static NSTextField   *prefsProxyHost;
+static NSTextField   *prefsProxyUser;
+static NSSecureTextField *prefsProxyPass;
+static NSTextField   *prefsDccIp;
 
 /* --- Menu items needing runtime state updates --- */
 static NSMenuItem    *topicBarMenuItem;
@@ -1108,6 +1132,7 @@ static void show_stub_alert (NSString *feature)
 
 /* Settings menu */
 - (void)menuStub:(id)sender;
+- (void)menuPreferences:(id)sender;
 
 /* Window menu */
 - (void)openDCCPanel:(id)sender;
@@ -1469,7 +1494,7 @@ create_menu_bar (void)
 	[appMenu addItem:[NSMenuItem separatorItem]];
 
 	[appMenu addItem:menu_item (@"Preferences\xE2\x80\xA6",
-		@selector(menuStub:), @",")];
+		@selector(menuPreferences:), @",")];
 	[appMenu addItem:[NSMenuItem separatorItem]];
 
 	/* Services submenu. */
@@ -3123,6 +3148,854 @@ edit_save_fields (void)
 	commandentry *e = g_slist_nth_data (editNet->commandlist, (guint)row);
 	if (e) servlist_command_remove (editNet, e);
 	[editCmdTable reloadData];
+}
+
+@end
+
+
+/* ==========================================================================
+ *  PREFERENCES DIALOG
+ * ==========================================================================
+ *
+ *  Ports the GTK setup.c preferences to native Cocoa.
+ *  7 tabs: Appearance, Input, Chatting, User List, Alerts, Logging, Network.
+ *  Auto-apply with a single Close button (macOS-native style).
+ *  Changes write directly to the global prefs struct; save_config() on close.
+ */
+
+/* --------------------------------------------------------------------------
+ *  Reusable widget helpers
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Bold section header.
+ */
+static void
+prefs_add_header (NSView *v, CGFloat *y, NSString *title)
+{
+	*y -= 8;
+	if (*y < [v bounds].size.height - 10)
+		*y -= 6;   /* extra gap between sections */
+	NSTextField *lbl = [NSTextField labelWithString:title];
+	[lbl setFrame:NSMakeRect (10, *y - 16, [v bounds].size.width - 20, 16)];
+	[lbl setFont:[NSFont boldSystemFontOfSize:12]];
+	[lbl setAutoresizingMask:NSViewWidthSizable];
+	[v addSubview:lbl];
+	*y -= 20;
+}
+
+/*
+ * Italic helper label.
+ */
+static void
+prefs_add_label (NSView *v, CGFloat *y, NSString *text)
+{
+	CGFloat W = [v bounds].size.width;
+	NSTextField *lbl = [NSTextField labelWithString:text];
+	[lbl setFrame:NSMakeRect (30, *y - 16, W - 40, 14)];
+	[lbl setFont:[NSFont systemFontOfSize:10]];
+	[lbl setTextColor:[NSColor secondaryLabelColor]];
+	[lbl setAutoresizingMask:NSViewWidthSizable];
+	[v addSubview:lbl];
+	*y -= 18;
+}
+
+/*
+ * Checkbox bound to an unsigned-int boolean pref.
+ * Tag stores the byte offset of the pref field so the generic
+ * prefsBoolToggled: action can write any boolean pref.
+ */
+static NSButton *
+prefs_add_checkbox (NSView *v, CGFloat *y, NSString *label,
+	unsigned int *prefPtr)
+{
+	CGFloat W = [v bounds].size.width;
+	NSButton *chk = [NSButton checkboxWithTitle:label
+		target:menuTarget action:@selector(prefsBoolToggled:)];
+	[chk setFrame:NSMakeRect (30, *y - 18, W - 40, 18)];
+	[chk setState:*prefPtr ? NSControlStateValueOn : NSControlStateValueOff];
+	[chk setTag:(NSInteger)((char *)prefPtr - (char *)&prefs)];
+	[chk setAutoresizingMask:NSViewWidthSizable];
+	[v addSubview:chk];
+	*y -= 22;
+	return chk;
+}
+
+/*
+ * Label + text field pair.  Returns the NSTextField.
+ */
+static NSTextField *
+prefs_add_textfield (NSView *v, CGFloat *y, NSString *label,
+	const char *value)
+{
+	CGFloat W = [v bounds].size.width;
+	NSTextField *lbl = [NSTextField labelWithString:label];
+	[lbl setFrame:NSMakeRect (14, *y - 16, 140, 16)];
+	[lbl setAlignment:NSTextAlignmentRight];
+	[lbl setFont:[NSFont systemFontOfSize:12]];
+	[lbl setAutoresizingMask:NSViewMinYMargin];
+	[v addSubview:lbl];
+
+	NSTextField *tf = [[NSTextField alloc]
+		initWithFrame:NSMakeRect (160, *y - 18, W - 174, 22)];
+	NSString *val = (value && value[0])
+		? [NSString stringWithUTF8String:value] : @"";
+	[tf setStringValue:val ?: @""];
+	[tf setFont:[NSFont systemFontOfSize:12]];
+	[tf setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
+	[v addSubview:tf];
+	*y -= 26;
+	return tf;
+}
+
+/*
+ * Label + secure text field pair.  Returns the NSSecureTextField.
+ */
+static NSSecureTextField *
+prefs_add_securefield (NSView *v, CGFloat *y, NSString *label,
+	const char *value)
+{
+	CGFloat W = [v bounds].size.width;
+	NSTextField *lbl = [NSTextField labelWithString:label];
+	[lbl setFrame:NSMakeRect (14, *y - 16, 140, 16)];
+	[lbl setAlignment:NSTextAlignmentRight];
+	[lbl setFont:[NSFont systemFontOfSize:12]];
+	[lbl setAutoresizingMask:NSViewMinYMargin];
+	[v addSubview:lbl];
+
+	NSSecureTextField *tf = [[NSSecureTextField alloc]
+		initWithFrame:NSMakeRect (160, *y - 18, W - 174, 22)];
+	NSString *val = (value && value[0])
+		? [NSString stringWithUTF8String:value] : @"";
+	[tf setStringValue:val ?: @""];
+	[tf setFont:[NSFont systemFontOfSize:12]];
+	[tf setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
+	[v addSubview:tf];
+	*y -= 26;
+	return tf;
+}
+
+/*
+ * Label + NSStepper + value field, bound to an int pref.
+ * Tag stores the byte offset of the pref field.
+ */
+static void
+prefs_add_stepper (NSView *v, CGFloat *y, NSString *label,
+	int *prefPtr, int minVal, int maxVal, NSString *suffix)
+{
+	CGFloat W = [v bounds].size.width;
+	int curVal = *prefPtr;
+	NSInteger tag = (NSInteger)((char *)prefPtr - (char *)&prefs);
+
+	NSTextField *lbl = [NSTextField labelWithString:label];
+	[lbl setFrame:NSMakeRect (14, *y - 16, 140, 16)];
+	[lbl setAlignment:NSTextAlignmentRight];
+	[lbl setFont:[NSFont systemFontOfSize:12]];
+	[v addSubview:lbl];
+
+	NSTextField *valField = [[NSTextField alloc]
+		initWithFrame:NSMakeRect (160, *y - 18, 70, 22)];
+	[valField setIntValue:curVal];
+	[valField setFont:[NSFont systemFontOfSize:12]];
+	[valField setTag:tag];
+	[valField setTarget:menuTarget];
+	[valField setAction:@selector(prefsStepperFieldEdited:)];
+	[v addSubview:valField];
+
+	NSStepper *stepper = [[NSStepper alloc]
+		initWithFrame:NSMakeRect (234, *y - 18, 19, 22)];
+	[stepper setMinValue:minVal];
+	[stepper setMaxValue:maxVal];
+	[stepper setIntValue:curVal];
+	[stepper setIncrement:1];
+	[stepper setValueWraps:NO];
+	[stepper setTag:tag];
+	[stepper setTarget:menuTarget];
+	[stepper setAction:@selector(prefsStepperChanged:)];
+	/* Store a reference to the value field via identifier trick:
+	   we use the Cocoa associated-objects pattern instead. For
+	   simplicity, we connect them by matching tags. */
+	[v addSubview:stepper];
+
+	if (suffix)
+	{
+		NSTextField *suf = [NSTextField labelWithString:suffix];
+		[suf setFrame:NSMakeRect (258, *y - 16, W - 268, 16)];
+		[suf setFont:[NSFont systemFontOfSize:11]];
+		[suf setTextColor:[NSColor secondaryLabelColor]];
+		[v addSubview:suf];
+	}
+
+	*y -= 26;
+}
+
+/*
+ * Label + NSPopUpButton, bound to an int pref.
+ * Tag stores the byte offset of the pref field.
+ */
+static NSPopUpButton *
+prefs_add_popup (NSView *v, CGFloat *y, NSString *label,
+	int *prefPtr, NSArray *options)
+{
+	CGFloat W = [v bounds].size.width;
+	NSInteger tag = (NSInteger)((char *)prefPtr - (char *)&prefs);
+
+	NSTextField *lbl = [NSTextField labelWithString:label];
+	[lbl setFrame:NSMakeRect (14, *y - 16, 140, 16)];
+	[lbl setAlignment:NSTextAlignmentRight];
+	[lbl setFont:[NSFont systemFontOfSize:12]];
+	[v addSubview:lbl];
+
+	NSPopUpButton *popup = [[NSPopUpButton alloc]
+		initWithFrame:NSMakeRect (160, *y - 20, W - 174, 26)
+		pullsDown:NO];
+	for (NSString *opt in options)
+		[popup addItemWithTitle:opt];
+	int cur = *prefPtr;
+	if (cur >= 0 && cur < (int)[options count])
+		[popup selectItemAtIndex:cur];
+	[popup setFont:[NSFont systemFontOfSize:12]];
+	[popup setTag:tag];
+	[popup setTarget:menuTarget];
+	[popup setAction:@selector(prefsMenuChanged:)];
+	[popup setAutoresizingMask:(NSViewWidthSizable)];
+	[v addSubview:popup];
+	*y -= 28;
+	return popup;
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 1 — Appearance
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_appearance_tab (NSView *v)
+{
+	CGFloat W = [v bounds].size.width;
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Font");
+
+	/* Font display + Choose button. */
+	{
+		NSTextField *lbl = [NSTextField labelWithString:@"Main font:"];
+		[lbl setFrame:NSMakeRect (14, y - 16, 140, 16)];
+		[lbl setAlignment:NSTextAlignmentRight];
+		[lbl setFont:[NSFont systemFontOfSize:12]];
+		[v addSubview:lbl];
+
+		prefsFontLabel = [NSTextField labelWithString:
+			[NSString stringWithUTF8String:
+				prefs.hex_text_font_main[0]
+					? prefs.hex_text_font_main : "Menlo 12"]];
+		[prefsFontLabel setFrame:NSMakeRect (160, y - 16, W - 254, 16)];
+		[prefsFontLabel setFont:[NSFont systemFontOfSize:12]];
+		[prefsFontLabel setAutoresizingMask:NSViewWidthSizable];
+		[v addSubview:prefsFontLabel];
+
+		NSButton *chooseBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (W - 90, y - 20, 80, 24)];
+		[chooseBtn setTitle:@"Choose\xE2\x80\xA6"];
+		[chooseBtn setBezelStyle:NSBezelStyleRounded];
+		[chooseBtn setTarget:menuTarget];
+		[chooseBtn setAction:@selector(prefsFontPicker:)];
+		[chooseBtn setAutoresizingMask:NSViewMinXMargin];
+		[v addSubview:chooseBtn];
+		y -= 28;
+	}
+
+	prefs_add_header (v, &y, @"Text Box");
+	prefs_add_checkbox (v, &y, @"Colored nick names",
+		&prefs.hex_text_color_nicks);
+	prefs_add_checkbox (v, &y, @"Indent nick names",
+		&prefs.hex_text_indent);
+	prefs_add_checkbox (v, &y, @"Show marker line",
+		&prefs.hex_text_show_marker);
+
+	prefs_add_header (v, &y, @"Timestamps");
+	prefs_add_checkbox (v, &y, @"Enable timestamps",
+		&prefs.hex_stamp_text);
+	prefsStampFmt = prefs_add_textfield (v, &y, @"Timestamp format:",
+		prefs.hex_stamp_text_format);
+	prefs_add_label (v, &y,
+		@"See strftime manpage for format codes.");
+
+	prefs_add_header (v, &y, @"Title Bar");
+	prefs_add_checkbox (v, &y, @"Show channel modes",
+		&prefs.hex_gui_win_modes);
+	prefs_add_checkbox (v, &y, @"Show number of users",
+		&prefs.hex_gui_win_ucount);
+	prefs_add_checkbox (v, &y, @"Show nickname",
+		&prefs.hex_gui_win_nick);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 2 — Input
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_input_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Input Box");
+	prefs_add_checkbox (v, &y, @"Use the text box font and colors",
+		&prefs.hex_gui_input_style);
+	prefs_add_checkbox (v, &y, @"Render colors and attributes",
+		&prefs.hex_gui_input_attr);
+	prefs_add_checkbox (v, &y, @"Spell checking",
+		&prefs.hex_gui_input_spell);
+	prefsSpellLangs = prefs_add_textfield (v, &y, @"Dictionaries:",
+		prefs.hex_text_spell_langs);
+	prefs_add_label (v, &y,
+		@"Separate multiple language codes with commas (e.g. en_US,fr).");
+
+	prefs_add_header (v, &y, @"Nick Completion");
+	prefsCompSuffix = prefs_add_textfield (v, &y,
+		@"Completion suffix:", prefs.hex_completion_suffix);
+	prefs_add_popup (v, &y, @"Completion sorted:",
+		&prefs.hex_completion_sort,
+		@[ @"A-Z", @"Last-spoke order" ]);
+	prefs_add_stepper (v, &y, @"Completion amount:",
+		&prefs.hex_completion_amount, 1, 1000, @"nicks");
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 3 — Chatting
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_chatting_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Default Messages");
+	prefsQuitMsg = prefs_add_textfield (v, &y, @"Quit:",
+		prefs.hex_irc_quit_reason);
+	prefsPartMsg = prefs_add_textfield (v, &y, @"Leave channel:",
+		prefs.hex_irc_part_reason);
+	prefsAwayMsg = prefs_add_textfield (v, &y, @"Away:",
+		prefs.hex_away_reason);
+
+	prefs_add_header (v, &y, @"Away");
+	prefs_add_checkbox (v, &y, @"Show away once",
+		&prefs.hex_away_show_once);
+	prefs_add_checkbox (v, &y, @"Automatically unmark away",
+		&prefs.hex_away_auto_unmark);
+
+	prefs_add_header (v, &y, @"Miscellaneous");
+	prefs_add_checkbox (v, &y, @"Display MODEs in raw form",
+		&prefs.hex_irc_raw_modes);
+	prefs_add_checkbox (v, &y, @"WHOIS on notify",
+		&prefs.hex_notify_whois_online);
+	prefs_add_checkbox (v, &y, @"Hide join and part messages",
+		&prefs.hex_irc_conf_mode);
+	prefs_add_checkbox (v, &y, @"Hide nick change messages",
+		&prefs.hex_irc_hide_nickchange);
+	prefsRealName = prefs_add_textfield (v, &y, @"Real name:",
+		prefs.hex_irc_real_name);
+	prefs_add_checkbox (v, &y, @"Display lists in compact mode",
+		&prefs.hex_gui_compact);
+	prefs_add_checkbox (v, &y, @"Use server time if supported",
+		&prefs.hex_irc_cap_server_time);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 4 — User List
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_userlist_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"User List");
+	prefs_add_checkbox (v, &y, @"Show hostnames in user list",
+		&prefs.hex_gui_ulist_show_hosts);
+	prefs_add_checkbox (v, &y, @"Use the text box font and colors",
+		&prefs.hex_gui_ulist_style);
+	prefs_add_checkbox (v, &y, @"Show icons for user modes",
+		&prefs.hex_gui_ulist_icons);
+	prefs_add_checkbox (v, &y, @"Color nicknames",
+		&prefs.hex_gui_ulist_color);
+	prefs_add_checkbox (v, &y, @"Show user count in channels",
+		&prefs.hex_gui_ulist_count);
+	prefs_add_popup (v, &y, @"Sorted by:",
+		&prefs.hex_gui_ulist_sort,
+		@[ @"A-Z, ops first", @"A-Z", @"Z-A, ops last",
+		   @"Z-A", @"Unsorted" ]);
+
+	prefs_add_header (v, &y, @"Away Tracking");
+	prefs_add_checkbox (v, &y,
+		@"Track away status of users",
+		&prefs.hex_away_track);
+	prefs_add_stepper (v, &y, @"On channels < :",
+		&prefs.hex_away_size_max, 1, 10000, @"users");
+
+	prefs_add_header (v, &y, @"Action Upon Double Click");
+	prefsUlistDblClick = prefs_add_textfield (v, &y,
+		@"Execute command:", prefs.hex_gui_ulist_doubleclick);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 5 — Alerts
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_alerts_tab (NSView *v)
+{
+	CGFloat W = [v bounds].size.width;
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Alerts");
+
+	/* Column headers for the 3-toggle rows. */
+	{
+		CGFloat colW = (W - 180) / 3;
+		NSArray *titles = @[ @"Channel", @"Private", @"Highlight" ];
+		for (int i = 0; i < 3; i++)
+		{
+			NSTextField *h = [NSTextField labelWithString:titles[i]];
+			[h setFrame:NSMakeRect (180 + i * colW, y - 14,
+				colW, 14)];
+			[h setAlignment:NSTextAlignmentCenter];
+			[h setFont:[NSFont boldSystemFontOfSize:10]];
+			[v addSubview:h];
+		}
+		y -= 18;
+	}
+
+	/* 3-toggle row helper macro. */
+	#define PREFS_3TOGGLE(LABEL, F1, F2, F3) \
+	do { \
+		CGFloat colW = (W - 180) / 3; \
+		NSTextField *lbl = [NSTextField labelWithString:LABEL]; \
+		[lbl setFrame:NSMakeRect (30, y - 16, 146, 16)]; \
+		[lbl setFont:[NSFont systemFontOfSize:12]]; \
+		[v addSubview:lbl]; \
+		unsigned int *ptrs[3] = { &prefs.F1, &prefs.F2, &prefs.F3 }; \
+		for (int _i = 0; _i < 3; _i++) \
+		{ \
+			NSButton *chk = [[NSButton alloc] \
+				initWithFrame:NSMakeRect ( \
+					180 + _i * colW + colW / 2 - 8, y - 16, 18, 18)]; \
+			[chk setButtonType:NSButtonTypeSwitch]; \
+			[chk setTitle:@""]; \
+			[chk setState:*ptrs[_i] \
+				? NSControlStateValueOn : NSControlStateValueOff]; \
+			[chk setTag:(NSInteger)((char *)ptrs[_i] - (char *)&prefs)]; \
+			[chk setTarget:menuTarget]; \
+			[chk setAction:@selector(prefsBoolToggled:)]; \
+			[v addSubview:chk]; \
+		} \
+		y -= 22; \
+	} while (0)
+
+	PREFS_3TOGGLE (@"Bounce dock icon:",
+		hex_input_flash_chans, hex_input_flash_priv,
+		hex_input_flash_hilight);
+
+	PREFS_3TOGGLE (@"Make a beep sound:",
+		hex_input_beep_chans, hex_input_beep_priv,
+		hex_input_beep_hilight);
+
+	#undef PREFS_3TOGGLE
+
+	y -= 4;
+	prefs_add_checkbox (v, &y,
+		@"Omit alerts when marked as being away",
+		&prefs.hex_away_omit_alerts);
+	prefs_add_checkbox (v, &y,
+		@"Omit alerts while the window is focused",
+		&prefs.hex_gui_focus_omitalerts);
+
+	prefs_add_header (v, &y, @"Highlighted Messages");
+	prefs_add_label (v, &y,
+		@"Highlighted messages are ones where your nickname is "
+		"mentioned, but also:");
+	prefsHilightExtra = prefs_add_textfield (v, &y,
+		@"Extra words:", prefs.hex_irc_extra_hilight);
+	prefsHilightNoNick = prefs_add_textfield (v, &y,
+		@"Nicks not to hilight:", prefs.hex_irc_no_hilight);
+	prefsHilightNick = prefs_add_textfield (v, &y,
+		@"Nicks to always hilight:", prefs.hex_irc_nick_hilight);
+	prefs_add_label (v, &y,
+		@"Separate multiple words with commas. Wildcards accepted.");
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 6 — Logging
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_logging_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Logging");
+	prefs_add_checkbox (v, &y,
+		@"Display scrollback from previous session",
+		&prefs.hex_text_replay);
+	prefs_add_stepper (v, &y, @"Scrollback lines:",
+		&prefs.hex_text_max_lines, 0, 100000, nil);
+	prefs_add_checkbox (v, &y,
+		@"Enable logging of conversations to disk",
+		&prefs.hex_irc_logging);
+	prefsLogMask = prefs_add_textfield (v, &y, @"Log filename:",
+		prefs.hex_irc_logmask);
+	prefs_add_label (v, &y,
+		@"%%s=Server  %%c=Channel  %%n=Network.");
+
+	prefs_add_header (v, &y, @"Timestamps");
+	prefs_add_checkbox (v, &y, @"Insert timestamps in logs",
+		&prefs.hex_stamp_log);
+	prefsLogStampFmt = prefs_add_textfield (v, &y,
+		@"Log timestamp format:", prefs.hex_stamp_log_format);
+
+	prefs_add_header (v, &y, @"URLs");
+	prefs_add_checkbox (v, &y, @"Enable logging of URLs to disk",
+		&prefs.hex_url_logging);
+	prefs_add_checkbox (v, &y, @"Enable URL grabber",
+		&prefs.hex_url_grabber);
+	prefs_add_stepper (v, &y, @"Max URLs to grab:",
+		&prefs.hex_url_grabber_limit, 0, 9999, nil);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 7 — Network
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_network_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Connection");
+	prefs_add_checkbox (v, &y,
+		@"Automatically reconnect to servers on disconnect",
+		&prefs.hex_net_auto_reconnect);
+	prefs_add_stepper (v, &y, @"Reconnect delay:",
+		&prefs.hex_net_reconnect_delay, 0, 9999, @"seconds");
+	prefs_add_stepper (v, &y, @"Auto join delay:",
+		&prefs.hex_irc_join_delay, 0, 9999, @"seconds");
+
+	prefs_add_header (v, &y, @"Proxy Server");
+	prefsProxyHost = prefs_add_textfield (v, &y, @"Hostname:",
+		prefs.hex_net_proxy_host);
+	prefs_add_stepper (v, &y, @"Port:",
+		&prefs.hex_net_proxy_port, 0, 65535, nil);
+	prefs_add_popup (v, &y, @"Type:",
+		&prefs.hex_net_proxy_type,
+		@[ @"(Disabled)", @"Wingate", @"SOCKS4",
+		   @"SOCKS5", @"HTTP", @"Auto" ]);
+	prefs_add_checkbox (v, &y,
+		@"Use authentication (HTTP or SOCKS5 only)",
+		&prefs.hex_net_proxy_auth);
+	prefsProxyUser = prefs_add_textfield (v, &y, @"Username:",
+		prefs.hex_net_proxy_user);
+	prefsProxyPass = prefs_add_securefield (v, &y, @"Password:",
+		prefs.hex_net_proxy_pass);
+
+	prefs_add_header (v, &y, @"File Transfers");
+	prefs_add_stepper (v, &y, @"First DCC port:",
+		&prefs.hex_dcc_port_first, 0, 65535, nil);
+	prefs_add_stepper (v, &y, @"Last DCC port:",
+		&prefs.hex_dcc_port_last, 0, 65535, nil);
+	prefs_add_checkbox (v, &y,
+		@"Get my address from the IRC server",
+		&prefs.hex_dcc_ip_from_server);
+	prefsDccIp = prefs_add_textfield (v, &y, @"DCC IP address:",
+		prefs.hex_dcc_ip);
+}
+
+/* --------------------------------------------------------------------------
+ *  show_preferences — create / show the Preferences window
+ * -------------------------------------------------------------------------- */
+static void
+show_preferences (void)
+{
+	@autoreleasepool
+	{
+		if (prefsWindow)
+		{
+			[prefsWindow makeKeyAndOrderFront:nil];
+			return;
+		}
+
+		/* --- Window --- */
+		NSRect frame = NSMakeRect (0, 0, 560, 480);
+		prefsWindow = [[NSWindow alloc]
+			initWithContentRect:frame
+			styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+				| NSWindowStyleMaskResizable)
+			backing:NSBackingStoreBuffered
+			defer:NO];
+		[prefsWindow center];
+		[prefsWindow setTitle:@"Preferences - MacChat"];
+		[prefsWindow setMinSize:NSMakeSize (480, 400)];
+
+		NSView *content = [prefsWindow contentView];
+		CGFloat W = [content bounds].size.width;
+		CGFloat H = [content bounds].size.height;
+
+		/* --- Tab view --- */
+		prefsTabView = [[NSTabView alloc]
+			initWithFrame:NSMakeRect (10, 44, W - 20, H - 54)];
+		[prefsTabView setAutoresizingMask:
+			(NSViewWidthSizable | NSViewHeightSizable)];
+
+		struct {
+			NSString *label;
+			NSString *ident;
+			void (*builder)(NSView *);
+		} tabs[] = {
+			{ @"Appearance", @"appearance", prefs_build_appearance_tab },
+			{ @"Input",      @"input",      prefs_build_input_tab },
+			{ @"Chatting",   @"chatting",   prefs_build_chatting_tab },
+			{ @"User List",  @"userlist",   prefs_build_userlist_tab },
+			{ @"Alerts",     @"alerts",     prefs_build_alerts_tab },
+			{ @"Logging",    @"logging",    prefs_build_logging_tab },
+			{ @"Network",    @"network",    prefs_build_network_tab },
+		};
+
+		for (int i = 0; i < 7; i++)
+		{
+			NSTabViewItem *item = [[NSTabViewItem alloc]
+				initWithIdentifier:tabs[i].ident];
+			[item setLabel:tabs[i].label];
+
+			/* Each tab gets a flipped-ish coordinate view.
+			   We build top-down manually using y decrements. */
+			NSRect tabRect = [[prefsTabView contentRect] isEqual:NSZeroRect]
+				? NSMakeRect (0, 0, W - 34, H - 80)
+				: [prefsTabView contentRect];
+			NSView *tabView = [[NSView alloc]
+				initWithFrame:NSMakeRect (0, 0,
+					tabRect.size.width, tabRect.size.height)];
+
+			/* Wrap in a scroll view so long tabs are scrollable. */
+			NSScrollView *sv = [[NSScrollView alloc]
+				initWithFrame:tabRect];
+			[sv setHasVerticalScroller:YES];
+			[sv setHasHorizontalScroller:NO];
+			[sv setBorderType:NSNoBorder];
+			[sv setAutoresizingMask:
+				(NSViewWidthSizable | NSViewHeightSizable)];
+			[sv setDocumentView:tabView];
+
+			tabs[i].builder (tabView);
+			[item setView:sv];
+			[prefsTabView addTabViewItem:item];
+		}
+
+		[content addSubview:prefsTabView];
+
+		/* --- Close button --- */
+		NSButton *closeBtn = [[NSButton alloc]
+			initWithFrame:NSMakeRect (W - 94, 8, 80, 32)];
+		[closeBtn setTitle:@"Close"];
+		[closeBtn setBezelStyle:NSBezelStyleRounded];
+		[closeBtn setTarget:menuTarget];
+		[closeBtn setAction:@selector(prefsClose:)];
+		[closeBtn setKeyEquivalent:@"\033"];   /* Escape */
+		[closeBtn setAutoresizingMask:
+			(NSViewMinXMargin | NSViewMaxYMargin)];
+		[content addSubview:closeBtn];
+
+		[prefsWindow makeKeyAndOrderFront:nil];
+	}
+}
+
+/* --------------------------------------------------------------------------
+ *  Helper: read all text fields back into the prefs struct.
+ * -------------------------------------------------------------------------- */
+static void
+prefs_save_fields (void)
+{
+	#define SAVE_STR(tf, dst) \
+		do { \
+			if (tf) { \
+				const char *_s = [[tf stringValue] UTF8String]; \
+				safe_strcpy (dst, _s ? _s : "", sizeof (dst)); \
+			} \
+		} while (0)
+
+	SAVE_STR (prefsStampFmt,       prefs.hex_stamp_text_format);
+	SAVE_STR (prefsSpellLangs,     prefs.hex_text_spell_langs);
+	SAVE_STR (prefsCompSuffix,     prefs.hex_completion_suffix);
+	SAVE_STR (prefsQuitMsg,        prefs.hex_irc_quit_reason);
+	SAVE_STR (prefsPartMsg,        prefs.hex_irc_part_reason);
+	SAVE_STR (prefsAwayMsg,        prefs.hex_away_reason);
+	SAVE_STR (prefsRealName,       prefs.hex_irc_real_name);
+	SAVE_STR (prefsUlistDblClick,  prefs.hex_gui_ulist_doubleclick);
+	SAVE_STR (prefsHilightExtra,   prefs.hex_irc_extra_hilight);
+	SAVE_STR (prefsHilightNoNick,  prefs.hex_irc_no_hilight);
+	SAVE_STR (prefsHilightNick,    prefs.hex_irc_nick_hilight);
+	SAVE_STR (prefsLogMask,        prefs.hex_irc_logmask);
+	SAVE_STR (prefsLogStampFmt,    prefs.hex_stamp_log_format);
+	SAVE_STR (prefsProxyHost,      prefs.hex_net_proxy_host);
+	SAVE_STR (prefsProxyUser,      prefs.hex_net_proxy_user);
+	SAVE_STR (prefsDccIp,          prefs.hex_dcc_ip);
+
+	/* Secure field (proxy password). */
+	if (prefsProxyPass)
+	{
+		const char *pw = [[prefsProxyPass stringValue] UTF8String];
+		safe_strcpy (prefs.hex_net_proxy_pass, pw ? pw : "",
+			sizeof (prefs.hex_net_proxy_pass));
+	}
+
+	#undef SAVE_STR
+}
+
+/* --------------------------------------------------------------------------
+ *  @implementation HCMenuTarget (Preferences)
+ * -------------------------------------------------------------------------- */
+
+@implementation HCMenuTarget (Preferences)
+
+- (void)menuPreferences:(id)sender
+{
+	show_preferences ();
+}
+
+- (void)prefsClose:(id)sender
+{
+	prefs_save_fields ();
+	save_config ();
+	[prefsWindow orderOut:nil];
+	prefsWindow = nil;
+	prefsTabView = nil;
+	prefsFontLabel = nil;
+	prefsStampFmt = prefsSpellLangs = prefsCompSuffix = nil;
+	prefsQuitMsg = prefsPartMsg = prefsAwayMsg = nil;
+	prefsRealName = prefsUlistDblClick = nil;
+	prefsHilightExtra = prefsHilightNoNick = prefsHilightNick = nil;
+	prefsLogMask = prefsLogStampFmt = nil;
+	prefsProxyHost = prefsProxyUser = nil;
+	prefsProxyPass = nil;
+	prefsDccIp = nil;
+}
+
+/*
+ * Generic boolean toggle handler.
+ * Tag = byte offset of the unsigned int field within struct hexchatprefs.
+ */
+- (void)prefsBoolToggled:(id)sender
+{
+	NSInteger off = [sender tag];
+	unsigned int *ptr = (unsigned int *)((char *)&prefs + off);
+	*ptr = ([sender state] == NSControlStateValueOn) ? 1 : 0;
+}
+
+/*
+ * Generic popup menu handler.
+ * Tag = byte offset of the int field within struct hexchatprefs.
+ */
+- (void)prefsMenuChanged:(id)sender
+{
+	NSInteger off = [sender tag];
+	int *ptr = (int *)((char *)&prefs + off);
+	*ptr = (int)[sender indexOfSelectedItem];
+}
+
+/*
+ * Generic stepper handler.
+ * Tag = byte offset of the int field within struct hexchatprefs.
+ * Also updates the companion text field (matched by tag).
+ */
+- (void)prefsStepperChanged:(id)sender
+{
+	NSInteger off = [sender tag];
+	int val = [sender intValue];
+	int *ptr = (int *)((char *)&prefs + off);
+	*ptr = val;
+
+	/* Find the companion text field with the same tag in the same superview. */
+	NSView *parent = [sender superview];
+	for (NSView *sibling in [parent subviews])
+	{
+		if (sibling != sender &&
+			[sibling isKindOfClass:[NSTextField class]] &&
+			[sibling tag] == off)
+		{
+			[(NSTextField *)sibling setIntValue:val];
+			break;
+		}
+	}
+}
+
+/*
+ * Text field next to a stepper was edited manually.
+ */
+- (void)prefsStepperFieldEdited:(id)sender
+{
+	NSInteger off = [sender tag];
+	int val = [sender intValue];
+	int *ptr = (int *)((char *)&prefs + off);
+	*ptr = val;
+
+	/* Sync companion stepper. */
+	NSView *parent = [sender superview];
+	for (NSView *sibling in [parent subviews])
+	{
+		if (sibling != sender &&
+			[sibling isKindOfClass:[NSStepper class]] &&
+			[sibling tag] == off)
+		{
+			[(NSStepper *)sibling setIntValue:val];
+			break;
+		}
+	}
+}
+
+/*
+ * Font picker — opens the macOS system font panel.
+ */
+- (void)prefsFontPicker:(id)sender
+{
+	/* Parse current font from prefs string ("FontName size"). */
+	NSString *fontStr = [NSString stringWithUTF8String:
+		prefs.hex_text_font_main[0]
+			? prefs.hex_text_font_main : "Menlo 12"];
+	NSFont *font = nil;
+
+	/* Try to extract "Name Size" from the string. */
+	NSRange lastSpace = [fontStr rangeOfString:@" "
+		options:NSBackwardsSearch];
+	if (lastSpace.location != NSNotFound)
+	{
+		NSString *name = [fontStr substringToIndex:lastSpace.location];
+		CGFloat size = [[fontStr substringFromIndex:
+			lastSpace.location + 1] doubleValue];
+		if (size < 4) size = 12;
+		font = [NSFont fontWithName:name size:size];
+	}
+	if (!font)
+		font = [NSFont userFixedPitchFontOfSize:12];
+
+	NSFontManager *fm = [NSFontManager sharedFontManager];
+	[fm setSelectedFont:font isMultiple:NO];
+	[fm orderFrontFontPanel:nil];
+
+	/* We handle changeFont: via the app delegate's first-responder chain.
+	   However, the simplest approach: set ourselves as the font target. */
+	[fm setTarget:menuTarget];
+	[fm setAction:@selector(prefsFontChanged:)];
+}
+
+/*
+ * Called by NSFontManager when user picks a font.
+ */
+- (void)prefsFontChanged:(id)sender
+{
+	NSFontManager *fm = (NSFontManager *)sender;
+	NSFont *font = [fm convertFont:
+		[NSFont userFixedPitchFontOfSize:12]];
+	if (!font)
+		return;
+
+	NSString *desc = [NSString stringWithFormat:@"%@ %.0f",
+		[font fontName], [font pointSize]];
+	safe_strcpy (prefs.hex_text_font_main,
+		[desc UTF8String],
+		sizeof (prefs.hex_text_font_main));
+
+	if (prefsFontLabel)
+		[prefsFontLabel setStringValue:desc];
 }
 
 @end
