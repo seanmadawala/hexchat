@@ -1403,9 +1403,13 @@ show_server_list (void)
 		[netsLabel setAutoresizingMask:NSViewMinYMargin];
 		[content addSubview:netsLabel];
 
-		/* Buttons on the right. */
+		/* Network table and buttons layout. */
 		CGFloat btnW = 80, btnH = 28, btnX = W - btnW - 14;
-		CGFloat btnTop = y - 6;
+		CGFloat tableTop = y - 6;
+		CGFloat tableH = 5 * (btnH + 4) + 20;  /* tall enough for buttons */
+		CGFloat tableBot = tableTop - tableH;
+
+		/* Buttons on the right, anchored to the bottom of the table area. */
 		NSArray *btnTitles = @[ @"Add", @"Remove", @"Edit\xE2\x80\xA6",
 								@"Sort", @"Favor" ];
 		SEL btnActions[] = {
@@ -1415,8 +1419,10 @@ show_server_list (void)
 		};
 		for (int i = 0; i < 5; i++)
 		{
+			/* Stack upward from the bottom: Favor at bottom, Add at top. */
 			NSButton *btn = [[NSButton alloc]
-				initWithFrame:NSMakeRect (btnX, btnTop - i * (btnH + 4),
+				initWithFrame:NSMakeRect (btnX,
+					tableBot + (4 - i) * (btnH + 4),
 					btnW, btnH)];
 			[btn setTitle:btnTitles[i]];
 			[btn setBezelStyle:NSBezelStyleRounded];
@@ -1428,8 +1434,6 @@ show_server_list (void)
 		}
 
 		/* Network table (left of buttons). */
-		CGFloat tableTop = y - 6;
-		CGFloat tableH = 5 * (btnH + 4) + 20;  /* tall enough for buttons */
 		CGFloat tableW = btnX - 24;
 		NSScrollView *scroll = [[NSScrollView alloc]
 			initWithFrame:NSMakeRect (14, tableTop - tableH, tableW, tableH)];
@@ -1945,25 +1949,25 @@ show_edit_network (ircnet *net)
 			CGFloat vW = [v bounds].size.width;
 			CGFloat vH = [v bounds].size.height;
 
-			/* Buttons on right. */
+			/* Buttons on right, anchored near bottom. */
 			CGFloat bW = 70, bH = 26, bX = vW - bW - 4;
-			NSButton *addBtn = [[NSButton alloc]
-				initWithFrame:NSMakeRect (bX, vH - bH - 2, bW, bH)];
-			[addBtn setTitle:@"Add"];
-			[addBtn setBezelStyle:NSBezelStyleRounded];
-			[addBtn setTarget:menuTarget];
-			[addBtn setAction:addSel];
-			[addBtn setAutoresizingMask:NSViewMinXMargin];
-			[v addSubview:addBtn];
-
 			NSButton *rmBtn = [[NSButton alloc]
-				initWithFrame:NSMakeRect (bX, vH - 2 * (bH + 4), bW, bH)];
+				initWithFrame:NSMakeRect (bX, 4, bW, bH)];
 			[rmBtn setTitle:@"Remove"];
 			[rmBtn setBezelStyle:NSBezelStyleRounded];
 			[rmBtn setTarget:menuTarget];
 			[rmBtn setAction:rmSel];
 			[rmBtn setAutoresizingMask:NSViewMinXMargin];
 			[v addSubview:rmBtn];
+
+			NSButton *addBtn = [[NSButton alloc]
+				initWithFrame:NSMakeRect (bX, 4 + bH + 4, bW, bH)];
+			[addBtn setTitle:@"Add"];
+			[addBtn setBezelStyle:NSBezelStyleRounded];
+			[addBtn setTarget:menuTarget];
+			[addBtn setAction:addSel];
+			[addBtn setAutoresizingMask:NSViewMinXMargin];
+			[v addSubview:addBtn];
 
 			/* Table. */
 			NSScrollView *sc = [[NSScrollView alloc]
