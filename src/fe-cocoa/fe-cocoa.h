@@ -77,6 +77,8 @@ typedef struct session_gui
 	char *input_text;      /* saved input text when this tab isn't focused     */
 	char *topic_text;      /* saved topic text                                 */
 
+	unsigned long marker_pos; /* character offset for marker line              */
+
 } session_gui;
 
 /*

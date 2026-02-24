@@ -265,6 +265,17 @@ static NSTableView   *dccTable;
 static NSMutableArray *dccTransfers;       /* Array of struct DCC * (wrapped) */
 static id             dccDataSource;
 
+/* --- Find bar (Edit > Find) --- */
+static NSView        *findBar;
+static NSTextField   *findField;
+static BOOL           findBarVisible;
+static NSRange        lastFindRange;
+
+/* --- Menu items needing runtime state updates --- */
+static NSMenuItem    *topicBarMenuItem;
+static NSMenuItem    *userListMenuItem;
+static NSMenuItem    *awayMenuItem;
+
 
 /* ==========================================================================
  *  FEATURE 1 — mIRC Color Palette Initialization
@@ -930,6 +941,30 @@ create_main_window (void)
 	[topicBar setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
 	[centerWrapper addSubview:topicBar];
 
+	/* Find bar (28px tall, below topic bar, initially hidden). */
+	NSRect findFrame = NSMakeRect (0, centerFrame.size.height - 24 - 28,
+		centerFrame.size.width, 28);
+	findBar = [[NSView alloc] initWithFrame:findFrame];
+	[findBar setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
+	[findBar setHidden:YES];
+	findBarVisible = NO;
+	lastFindRange = NSMakeRange (0, 0);
+
+	NSTextField *findLabel = [NSTextField labelWithString:@"Find:"];
+	[findLabel setFrame:NSMakeRect (4, 4, 36, 20)];
+	[findLabel setFont:[NSFont systemFontOfSize:11]];
+	[findLabel setTextColor:[NSColor secondaryLabelColor]];
+	[findBar addSubview:findLabel];
+
+	findField = [[NSTextField alloc]
+		initWithFrame:NSMakeRect (42, 4, findFrame.size.width - 50, 20)];
+	[findField setFont:[NSFont systemFontOfSize:12]];
+	[findField setAutoresizingMask:NSViewWidthSizable];
+	[findField setPlaceholderString:@"Search text\xE2\x80\xA6"];
+	[findBar addSubview:findField];
+
+	[centerWrapper addSubview:findBar];
+
 	/* Chat scroll view (fills below topic bar). */
 	NSRect chatFrame = NSMakeRect (0, 0, centerFrame.size.width,
 		centerFrame.size.height - 24);
@@ -1024,22 +1059,387 @@ create_main_window (void)
 
 
 /* ==========================================================================
- *  MENU BAR — Now includes Server List and DCC items
+ *  MENU BAR — Full native macOS menu bar
  * ==========================================================================
  */
 
+static void show_stub_alert (NSString *feature)
+{
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:[NSString stringWithFormat:@"%@ is not yet implemented.",
+		feature]];
+	[alert setInformativeText:@"This feature will be added in a future update."];
+	[alert addButtonWithTitle:@"OK"];
+	[alert runModal];
+}
+
 /* Menu action targets — we need a class to receive selectors. */
 @interface HCMenuTarget : NSObject
+
+/* File menu */
 - (void)openServerList:(id)sender;
+- (void)menuNewServerTab:(id)sender;
+- (void)menuNewChannelTab:(id)sender;
+- (void)menuNewServerWindow:(id)sender;
+- (void)menuNewChannelWindow:(id)sender;
+- (void)menuLoadPlugin:(id)sender;
+- (void)menuCloseTab:(id)sender;
+
+/* Edit menu */
+- (void)menuCopySelection:(id)sender;
+- (void)menuFind:(id)sender;
+- (void)menuFindNext:(id)sender;
+- (void)menuFindPrev:(id)sender;
+- (void)menuClearText:(id)sender;
+
+/* View menu */
+- (void)menuToggleTopicBar:(id)sender;
+- (void)menuToggleUserList:(id)sender;
+- (void)menuFullscreen:(id)sender;
+
+/* Server menu */
+- (void)menuDisconnect:(id)sender;
+- (void)menuReconnect:(id)sender;
+- (void)menuJoinChannel:(id)sender;
+- (void)menuChannelList:(id)sender;
+- (void)menuAway:(id)sender;
+
+/* Settings menu */
+- (void)menuStub:(id)sender;
+
+/* Window menu */
 - (void)openDCCPanel:(id)sender;
+- (void)menuResetMarker:(id)sender;
+- (void)menuMoveToMarker:(id)sender;
+- (void)menuSaveText:(id)sender;
+
+/* Help menu */
+- (void)menuAbout:(id)sender;
+- (void)menuDocs:(id)sender;
+
 @end
 
 @implementation HCMenuTarget
+
+/* --- File menu --- */
+
 - (void)openServerList:(id)sender { show_server_list (); }
-- (void)openDCCPanel:(id)sender   { show_dcc_panel (); }
+
+- (void)menuNewServerTab:(id)sender
+{
+	new_ircwindow (current_sess->server, NULL, SESS_SERVER, 0);
+}
+
+- (void)menuNewChannelTab:(id)sender
+{
+	new_ircwindow (current_sess->server, NULL, SESS_CHANNEL, 0);
+}
+
+- (void)menuNewServerWindow:(id)sender
+{
+	new_ircwindow (NULL, NULL, SESS_SERVER, 0);
+}
+
+- (void)menuNewChannelWindow:(id)sender
+{
+	new_ircwindow (current_sess->server, NULL, SESS_CHANNEL, 0);
+}
+
+- (void)menuLoadPlugin:(id)sender
+{
+	show_stub_alert (@"Load Plugin or Script");
+}
+
+- (void)menuCloseTab:(id)sender
+{
+	handle_command (current_sess, "CLOSE", FALSE);
+}
+
+/* --- Edit menu --- */
+
+- (void)menuCopySelection:(id)sender
+{
+	[chatTextView copy:nil];
+}
+
+- (void)menuFind:(id)sender
+{
+	if (!findBar || !centerWrapper)
+		return;
+
+	findBarVisible = !findBarVisible;
+	[findBar setHidden:!findBarVisible];
+
+	/* Recalculate chat scroll frame. */
+	CGFloat topicH = [topicBar isHidden] ? 0 : 24;
+	CGFloat findH = findBarVisible ? 28 : 0;
+	CGFloat wrapH = [centerWrapper frame].size.height;
+	CGFloat wrapW = [centerWrapper frame].size.width;
+
+	[chatScrollView setFrame:NSMakeRect (0, 0, wrapW,
+		wrapH - topicH - findH)];
+	[findBar setFrame:NSMakeRect (0, wrapH - topicH - findH,
+		wrapW, 28)];
+
+	if (findBarVisible)
+		[[findField window] makeFirstResponder:findField];
+}
+
+- (void)menuFindNext:(id)sender
+{
+	if (!findField || !chatTextView)
+		return;
+	NSString *needle = [findField stringValue];
+	if ([needle length] == 0)
+	{
+		/* If no search term yet, open the find bar. */
+		if (!findBarVisible)
+			[self menuFind:sender];
+		return;
+	}
+
+	NSString *haystack = [[chatTextView textStorage] string];
+	NSUInteger start = lastFindRange.location + lastFindRange.length;
+	if (start >= [haystack length])
+		start = 0;
+	NSRange searchRange = NSMakeRange (start,
+		[haystack length] - start);
+	NSRange found = [haystack rangeOfString:needle
+		options:NSCaseInsensitiveSearch range:searchRange];
+	if (found.location == NSNotFound && start > 0)
+	{
+		/* Wrap around. */
+		found = [haystack rangeOfString:needle
+			options:NSCaseInsensitiveSearch
+			range:NSMakeRange (0, [haystack length])];
+	}
+	if (found.location != NSNotFound)
+	{
+		lastFindRange = found;
+		[chatTextView setSelectedRange:found];
+		[chatTextView scrollRangeToVisible:found];
+	}
+	else
+	{
+		NSBeep ();
+	}
+}
+
+- (void)menuFindPrev:(id)sender
+{
+	if (!findField || !chatTextView)
+		return;
+	NSString *needle = [findField stringValue];
+	if ([needle length] == 0)
+		return;
+
+	NSString *haystack = [[chatTextView textStorage] string];
+	NSUInteger end = lastFindRange.location;
+	if (end == 0)
+		end = [haystack length];
+	NSRange searchRange = NSMakeRange (0, end);
+	NSRange found = [haystack rangeOfString:needle
+		options:(NSCaseInsensitiveSearch | NSBackwardsSearch)
+		range:searchRange];
+	if (found.location == NSNotFound)
+	{
+		/* Wrap around. */
+		found = [haystack rangeOfString:needle
+			options:(NSCaseInsensitiveSearch | NSBackwardsSearch)
+			range:NSMakeRange (0, [haystack length])];
+	}
+	if (found.location != NSNotFound)
+	{
+		lastFindRange = found;
+		[chatTextView setSelectedRange:found];
+		[chatTextView scrollRangeToVisible:found];
+	}
+	else
+	{
+		NSBeep ();
+	}
+}
+
+- (void)menuClearText:(id)sender
+{
+	fe_text_clear (current_sess, 0);
+}
+
+/* --- View menu --- */
+
+- (void)menuToggleTopicBar:(id)sender
+{
+	BOOL nowHidden = ![topicBar isHidden];
+	[topicBar setHidden:nowHidden];
+
+	/* Update checkmark. */
+	[topicBarMenuItem setState:nowHidden ? NSControlStateValueOff
+		: NSControlStateValueOn];
+
+	/* Resize chat to fill. */
+	CGFloat topicH = nowHidden ? 0 : 24;
+	CGFloat findH = findBarVisible ? 28 : 0;
+	CGFloat wrapH = [centerWrapper frame].size.height;
+	CGFloat wrapW = [centerWrapper frame].size.width;
+	[chatScrollView setFrame:NSMakeRect (0, 0, wrapW,
+		wrapH - topicH - findH)];
+}
+
+- (void)menuToggleUserList:(id)sender
+{
+	BOOL nowHidden = ![userListScroll isHidden];
+	[userListScroll setHidden:nowHidden];
+	[userCountLabel setHidden:nowHidden];
+	[rightWrapper setHidden:nowHidden];
+
+	/* Update checkmark. */
+	[userListMenuItem setState:nowHidden ? NSControlStateValueOff
+		: NSControlStateValueOn];
+}
+
+- (void)menuFullscreen:(id)sender
+{
+	[mainWindow toggleFullScreen:nil];
+}
+
+/* --- Server menu --- */
+
+- (void)menuDisconnect:(id)sender
+{
+	handle_command (current_sess, "DISCON", FALSE);
+}
+
+- (void)menuReconnect:(id)sender
+{
+	handle_command (current_sess, "RECONNECT", FALSE);
+}
+
+- (void)menuJoinChannel:(id)sender
+{
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"Join a Channel"];
+	[alert setInformativeText:@"Enter channel name:"];
+	[alert addButtonWithTitle:@"Join"];
+	[alert addButtonWithTitle:@"Cancel"];
+
+	NSTextField *chanField = [[NSTextField alloc]
+		initWithFrame:NSMakeRect (0, 0, 220, 24)];
+	[chanField setStringValue:@"#"];
+	[alert setAccessoryView:chanField];
+
+	/* Make text field first responder. */
+	[[alert window] setInitialFirstResponder:chanField];
+
+	if ([alert runModal] == NSAlertFirstButtonReturn)
+	{
+		NSString *chan = [chanField stringValue];
+		if ([chan length] > 0)
+		{
+			char cmd[512];
+			snprintf (cmd, sizeof (cmd), "join %s",
+				[chan UTF8String]);
+			handle_command (current_sess, cmd, FALSE);
+		}
+	}
+}
+
+- (void)menuChannelList:(id)sender
+{
+	show_stub_alert (@"Channel List");
+}
+
+- (void)menuAway:(id)sender
+{
+	if (current_sess->server->is_away)
+		handle_command (current_sess, "back", FALSE);
+	else
+		handle_command (current_sess, "away", FALSE);
+}
+
+/* --- Settings menu (all stubs) --- */
+
+- (void)menuStub:(id)sender
+{
+	NSMenuItem *mi = (NSMenuItem *)sender;
+	show_stub_alert ([mi title]);
+}
+
+/* --- Window menu --- */
+
+- (void)openDCCPanel:(id)sender { show_dcc_panel (); }
+
+- (void)menuResetMarker:(id)sender
+{
+	if (!current_sess || !current_sess->gui)
+		return;
+	NSTextStorage *storage = get_text_storage (current_sess);
+	if (storage)
+		current_sess->gui->marker_pos =
+			(unsigned long)[[storage string] length];
+}
+
+- (void)menuMoveToMarker:(id)sender
+{
+	if (!current_sess || !current_sess->gui)
+		return;
+	NSUInteger pos = (NSUInteger)current_sess->gui->marker_pos;
+	NSTextStorage *storage = get_text_storage (current_sess);
+	if (!storage)
+		return;
+	if (pos > [[storage string] length])
+		pos = [[storage string] length];
+	[chatTextView scrollRangeToVisible:NSMakeRange (pos, 0)];
+}
+
+- (void)menuSaveText:(id)sender
+{
+	show_stub_alert (@"Save Text");
+}
+
+/* --- Help menu --- */
+
+- (void)menuAbout:(id)sender
+{
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"HexChat " PACKAGE_VERSION];
+	[alert setInformativeText:
+		@"An IRC client for macOS.\n\n"
+		"Copyright \xC2\xA9 2026 Sean Madawala.\n"
+		"Based on HexChat by the HexChat team.\n\n"
+		"https://hexchat.github.io"];
+	[alert setAlertStyle:NSAlertStyleInformational];
+	[alert addButtonWithTitle:@"OK"];
+	[alert runModal];
+}
+
+- (void)menuDocs:(id)sender
+{
+	fe_open_url ("https://hexchat.readthedocs.org");
+}
+
 @end
 
 static id menuTarget;
+
+/* Helper: create a menu item targeting menuTarget. */
+static NSMenuItem *
+menu_item (NSString *title, SEL action, NSString *key)
+{
+	NSMenuItem *item = [[NSMenuItem alloc]
+		initWithTitle:title action:action keyEquivalent:key];
+	[item setTarget:menuTarget];
+	return item;
+}
+
+/* Helper: create a menu item with modifier mask. */
+static NSMenuItem *
+menu_item_mod (NSString *title, SEL action, NSString *key,
+	NSEventModifierFlags mask)
+{
+	NSMenuItem *item = menu_item (title, action, key);
+	[item setKeyEquivalentModifierMask:mask];
+	return item;
+}
 
 static void
 create_menu_bar (void)
@@ -1048,33 +1448,237 @@ create_menu_bar (void)
 
 	NSMenu *menuBar = [[NSMenu alloc] init];
 
-	/* --- App menu --- */
+	/* =================================================================
+	 *  APP MENU (HexChat)
+	 * ================================================================= */
 	NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
 	[menuBar addItem:appMenuItem];
-	NSMenu *appMenu = [[NSMenu alloc] init];
+	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"HexChat"];
+
+	[appMenu addItem:menu_item (@"About HexChat",
+		@selector(menuAbout:), @"")];
+	[appMenu addItem:[NSMenuItem separatorItem]];
+
+	[appMenu addItem:menu_item (@"Preferences\xE2\x80\xA6",
+		@selector(menuStub:), @",")];
+	[appMenu addItem:[NSMenuItem separatorItem]];
+
+	/* Services submenu. */
+	NSMenu *servicesMenu = [[NSMenu alloc] initWithTitle:@"Services"];
+	NSMenuItem *servicesItem = [[NSMenuItem alloc]
+		initWithTitle:@"Services" action:nil keyEquivalent:@""];
+	[servicesItem setSubmenu:servicesMenu];
+	[appMenu addItem:servicesItem];
+	[NSApp setServicesMenu:servicesMenu];
+
+	[appMenu addItem:[NSMenuItem separatorItem]];
+
+	[appMenu addItemWithTitle:@"Hide HexChat"
+		action:@selector(hide:) keyEquivalent:@"h"];
+
+	NSMenuItem *hideOthers = [appMenu addItemWithTitle:@"Hide Others"
+		action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+	[hideOthers setKeyEquivalentModifierMask:
+		(NSEventModifierFlagCommand | NSEventModifierFlagOption)];
+
+	[appMenu addItemWithTitle:@"Show All"
+		action:@selector(unhideAllApplications:) keyEquivalent:@""];
+
+	[appMenu addItem:[NSMenuItem separatorItem]];
+
 	[appMenu addItemWithTitle:@"Quit HexChat"
 		action:@selector(terminate:) keyEquivalent:@"q"];
+
 	[appMenuItem setSubmenu:appMenu];
 
-	/* --- IRC menu --- */
-	NSMenuItem *ircMenuItem = [[NSMenuItem alloc] init];
-	[menuBar addItem:ircMenuItem];
-	NSMenu *ircMenu = [[NSMenu alloc] initWithTitle:@"IRC"];
+	/* =================================================================
+	 *  FILE MENU
+	 * ================================================================= */
+	NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:fileMenuItem];
+	NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
 
-	NSMenuItem *srvItem = [[NSMenuItem alloc]
-		initWithTitle:@"Server List..."
-		action:@selector(openServerList:) keyEquivalent:@"s"];
-	[srvItem setTarget:menuTarget];
-	[ircMenu addItem:srvItem];
+	[fileMenu addItem:menu_item (@"Network List\xE2\x80\xA6",
+		@selector(openServerList:), @"s")];
+	[fileMenu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *dccItem = [[NSMenuItem alloc]
-		initWithTitle:@"DCC Transfers..."
-		action:@selector(openDCCPanel:) keyEquivalent:@"t"];
-	[dccItem setTarget:menuTarget];
-	[ircMenu addItem:dccItem];
+	/* New submenu. */
+	NSMenu *newSub = [[NSMenu alloc] initWithTitle:@"New"];
+	[newSub addItem:menu_item (@"Server Tab",
+		@selector(menuNewServerTab:), @"t")];
+	[newSub addItem:menu_item (@"Channel Tab",
+		@selector(menuNewChannelTab:), @"")];
+	[newSub addItem:menu_item (@"Server Window",
+		@selector(menuNewServerWindow:), @"n")];
+	[newSub addItem:menu_item (@"Channel Window",
+		@selector(menuNewChannelWindow:), @"")];
 
-	[ircMenuItem setSubmenu:ircMenu];
+	NSMenuItem *newSubItem = [[NSMenuItem alloc]
+		initWithTitle:@"New" action:nil keyEquivalent:@""];
+	[newSubItem setSubmenu:newSub];
+	[fileMenu addItem:newSubItem];
 
+	[fileMenu addItem:[NSMenuItem separatorItem]];
+	[fileMenu addItem:menu_item (@"Load Plugin or Script\xE2\x80\xA6",
+		@selector(menuLoadPlugin:), @"")];
+	[fileMenu addItem:[NSMenuItem separatorItem]];
+	[fileMenu addItem:menu_item (@"Close Tab",
+		@selector(menuCloseTab:), @"w")];
+
+	[fileMenuItem setSubmenu:fileMenu];
+
+	/* =================================================================
+	 *  EDIT MENU
+	 * ================================================================= */
+	NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:editMenuItem];
+	NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+
+	[editMenu addItem:menu_item_mod (@"Copy Selection",
+		@selector(menuCopySelection:), @"C",
+		(NSEventModifierFlagCommand | NSEventModifierFlagShift))];
+	[editMenu addItem:[NSMenuItem separatorItem]];
+	[editMenu addItem:menu_item (@"Find\xE2\x80\xA6",
+		@selector(menuFind:), @"f")];
+	[editMenu addItem:menu_item (@"Find Next",
+		@selector(menuFindNext:), @"g")];
+	[editMenu addItem:menu_item_mod (@"Find Previous",
+		@selector(menuFindPrev:), @"G",
+		(NSEventModifierFlagCommand | NSEventModifierFlagShift))];
+	[editMenu addItem:[NSMenuItem separatorItem]];
+	[editMenu addItem:menu_item (@"Clear Text",
+		@selector(menuClearText:), @"")];
+
+	[editMenuItem setSubmenu:editMenu];
+
+	/* =================================================================
+	 *  VIEW MENU
+	 * ================================================================= */
+	NSMenuItem *viewMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:viewMenuItem];
+	NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+
+	topicBarMenuItem = menu_item (@"Topic Bar",
+		@selector(menuToggleTopicBar:), @"");
+	[topicBarMenuItem setState:NSControlStateValueOn];
+	[viewMenu addItem:topicBarMenuItem];
+
+	userListMenuItem = menu_item (@"User List",
+		@selector(menuToggleUserList:), @"");
+	[userListMenuItem setState:NSControlStateValueOn];
+	[viewMenu addItem:userListMenuItem];
+
+	[viewMenu addItem:[NSMenuItem separatorItem]];
+
+	[viewMenu addItem:menu_item_mod (@"Fullscreen",
+		@selector(menuFullscreen:), @"f",
+		(NSEventModifierFlagCommand | NSEventModifierFlagControl))];
+
+	[viewMenuItem setSubmenu:viewMenu];
+
+	/* =================================================================
+	 *  SERVER MENU
+	 * ================================================================= */
+	NSMenuItem *serverMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:serverMenuItem];
+	NSMenu *serverMenu = [[NSMenu alloc] initWithTitle:@"Server"];
+
+	[serverMenu addItem:menu_item (@"Disconnect",
+		@selector(menuDisconnect:), @"")];
+	[serverMenu addItem:menu_item (@"Reconnect",
+		@selector(menuReconnect:), @"")];
+	[serverMenu addItem:[NSMenuItem separatorItem]];
+	[serverMenu addItem:menu_item (@"Join a Channel\xE2\x80\xA6",
+		@selector(menuJoinChannel:), @"")];
+	[serverMenu addItem:menu_item (@"Channel List\xE2\x80\xA6",
+		@selector(menuChannelList:), @"")];
+	[serverMenu addItem:[NSMenuItem separatorItem]];
+
+	awayMenuItem = menu_item (@"Marked Away",
+		@selector(menuAway:), @"");
+	[serverMenu addItem:awayMenuItem];
+
+	[serverMenuItem setSubmenu:serverMenu];
+
+	/* =================================================================
+	 *  SETTINGS MENU
+	 * ================================================================= */
+	NSMenuItem *settingsMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:settingsMenuItem];
+	NSMenu *settingsMenu = [[NSMenu alloc] initWithTitle:@"Settings"];
+
+	NSString *settingsItems[] = {
+		@"Auto Replace", @"CTCP Replies", @"Dialog Buttons",
+		@"Keyboard Shortcuts", @"Text Events", @"URL Handlers",
+		@"User Commands", @"User List Buttons", @"User List Popup",
+		nil
+	};
+	for (int i = 0; settingsItems[i]; i++)
+		[settingsMenu addItem:menu_item (settingsItems[i],
+			@selector(menuStub:), @"")];
+
+	[settingsMenuItem setSubmenu:settingsMenu];
+
+	/* =================================================================
+	 *  WINDOW MENU
+	 * ================================================================= */
+	NSMenuItem *windowMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:windowMenuItem];
+	NSMenu *windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
+
+	[windowMenu addItemWithTitle:@"Minimize"
+		action:@selector(miniaturize:) keyEquivalent:@"m"];
+	[windowMenu addItemWithTitle:@"Zoom"
+		action:@selector(performZoom:) keyEquivalent:@""];
+
+	[windowMenu addItem:[NSMenuItem separatorItem]];
+
+	NSString *windowStubs[] = {
+		@"Ban List", @"Character Chart", @"Direct Chat",
+		nil
+	};
+	for (int i = 0; windowStubs[i]; i++)
+		[windowMenu addItem:menu_item (windowStubs[i],
+			@selector(menuStub:), @"")];
+
+	[windowMenu addItem:menu_item (@"File Transfers",
+		@selector(openDCCPanel:), @"")];
+
+	NSString *windowStubs2[] = {
+		@"Friends List", @"Ignore List",
+		@"Plugins and Scripts", @"Raw Log", @"URL Grabber",
+		nil
+	};
+	for (int i = 0; windowStubs2[i]; i++)
+		[windowMenu addItem:menu_item (windowStubs2[i],
+			@selector(menuStub:), @"")];
+
+	[windowMenu addItem:[NSMenuItem separatorItem]];
+	[windowMenu addItem:menu_item (@"Reset Marker Line",
+		@selector(menuResetMarker:), @"")];
+	[windowMenu addItem:menu_item (@"Move to Marker Line",
+		@selector(menuMoveToMarker:), @"")];
+	[windowMenu addItem:[NSMenuItem separatorItem]];
+	[windowMenu addItem:menu_item (@"Save Text\xE2\x80\xA6",
+		@selector(menuSaveText:), @"")];
+
+	[windowMenuItem setSubmenu:windowMenu];
+	[NSApp setWindowsMenu:windowMenu];
+
+	/* =================================================================
+	 *  HELP MENU
+	 * ================================================================= */
+	NSMenuItem *helpMenuItem = [[NSMenuItem alloc] init];
+	[menuBar addItem:helpMenuItem];
+	NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
+
+	[helpMenu addItem:menu_item (@"HexChat Documentation",
+		@selector(menuDocs:), @"")];
+
+	[helpMenuItem setSubmenu:helpMenu];
+	[NSApp setHelpMenu:helpMenu];
+
+	/* --- Set the menu bar --- */
 	[NSApp setMainMenu:menuBar];
 }
 
