@@ -56,6 +56,7 @@
 #include "../common/fe.h"
 #include "../common/servlist.h"
 #include "../common/userlist.h"
+#include "../common/text.h"
 
 #include "fe-cocoa.h"
 
@@ -294,6 +295,15 @@ static NSTextField   *prefsProxyHost;
 static NSTextField   *prefsProxyUser;
 static NSSecureTextField *prefsProxyPass;
 static NSTextField   *prefsDccIp;
+/* New fields for expanded preferences tabs: */
+static NSTextField   *prefsBgImage;
+static NSTextField   *prefsBindHost;
+static NSTextField   *prefsDccDir;
+static NSTextField   *prefsDccCompletedDir;
+/* Sounds tab state: */
+static NSTableView   *soundsTable;
+static NSTextField   *soundsFileField;
+static int            soundsSelectedRow = -1;
 
 /* --- Menu items needing runtime state updates --- */
 static NSMenuItem    *topicBarMenuItem;
@@ -3426,6 +3436,20 @@ prefs_build_appearance_tab (NSView *v)
 		&prefs.hex_gui_win_ucount);
 	prefs_add_checkbox (v, &y, @"Show nickname",
 		&prefs.hex_gui_win_nick);
+
+	prefs_add_header (v, &y, @"Colors");
+	prefs_add_checkbox (v, &y, @"Strip colors from messages",
+		&prefs.hex_text_stripcolor_msg);
+	prefs_add_checkbox (v, &y, @"Strip colors from scrollback",
+		&prefs.hex_text_stripcolor_replay);
+	prefs_add_checkbox (v, &y, @"Strip colors from topic",
+		&prefs.hex_text_stripcolor_topic);
+
+	prefs_add_header (v, &y, @"Display");
+	prefs_add_stepper (v, &y, @"Transparency:",
+		&prefs.hex_gui_transparency, 0, 255, @"(0=opaque)");
+	prefsBgImage = prefs_add_textfield (v, &y, @"Background image:",
+		prefs.hex_text_background);
 }
 
 /* --------------------------------------------------------------------------
@@ -3456,6 +3480,12 @@ prefs_build_input_tab (NSView *v)
 		@[ @"A-Z", @"Last-spoke order" ]);
 	prefs_add_stepper (v, &y, @"Completion amount:",
 		&prefs.hex_completion_amount, 1, 1000, @"nicks");
+
+	prefs_add_header (v, &y, @"Nick Box");
+	prefs_add_checkbox (v, &y, @"Show nickname in input box",
+		&prefs.hex_gui_input_nick);
+	prefs_add_checkbox (v, &y, @"Show mode icon in nick box",
+		&prefs.hex_gui_input_icon);
 }
 
 /* --------------------------------------------------------------------------
@@ -3495,6 +3525,20 @@ prefs_build_chatting_tab (NSView *v)
 		&prefs.hex_gui_compact);
 	prefs_add_checkbox (v, &y, @"Use server time if supported",
 		&prefs.hex_irc_cap_server_time);
+
+	prefs_add_header (v, &y, @"Auto-copy");
+	prefs_add_checkbox (v, &y, @"Automatically copy selected text",
+		&prefs.hex_text_autocopy_text);
+	prefs_add_checkbox (v, &y, @"Include timestamps when copying",
+		&prefs.hex_text_autocopy_stamp);
+	prefs_add_checkbox (v, &y, @"Include color codes when copying",
+		&prefs.hex_text_autocopy_color);
+
+	prefs_add_header (v, &y, @"IRC");
+	prefs_add_popup (v, &y, @"Ban type:",
+		&prefs.hex_irc_ban_type,
+		@[ @"Host (nick!*@*.host)", @"Domain (*!*@domain.com)",
+		   @"IP (*!*@1.2.3.*)", @"Full (nick!user@host)" ]);
 }
 
 /* --------------------------------------------------------------------------
@@ -3531,6 +3575,17 @@ prefs_build_userlist_tab (NSView *v)
 	prefs_add_header (v, &y, @"Action Upon Double Click");
 	prefsUlistDblClick = prefs_add_textfield (v, &y,
 		@"Execute command:", prefs.hex_gui_ulist_doubleclick);
+
+	prefs_add_header (v, &y, @"Position & Meters");
+	prefs_add_popup (v, &y, @"User list position:",
+		&prefs.hex_gui_ulist_pos,
+		@[ @"Left", @"Right" ]);
+	prefs_add_popup (v, &y, @"Lag meter:",
+		&prefs.hex_gui_lagometer,
+		@[ @"Off", @"Graphical", @"Text", @"Both" ]);
+	prefs_add_popup (v, &y, @"Throttle meter:",
+		&prefs.hex_gui_throttlemeter,
+		@[ @"Off", @"Graphical", @"Text", @"Both" ]);
 }
 
 /* --------------------------------------------------------------------------
@@ -3616,10 +3671,134 @@ prefs_build_alerts_tab (NSView *v)
 		@"Nicks to always hilight:", prefs.hex_irc_nick_hilight);
 	prefs_add_label (v, &y,
 		@"Separate multiple words with commas. Wildcards accepted.");
+
+	prefs_add_header (v, &y, @"Notifications");
+	prefs_add_label (v, &y,
+		@"Send macOS notifications for:");
+
+	/* 3-toggle row header for notifications. */
+	{
+		CGFloat colW = (W - 180) / 3;
+		NSArray *titles = @[ @"Channel", @"Private", @"Highlight" ];
+		for (int i = 0; i < 3; i++)
+		{
+			NSTextField *h = [NSTextField labelWithString:titles[i]];
+			[h setFrame:NSMakeRect (180 + i * colW, y - 14,
+				colW, 14)];
+			[h setAlignment:NSTextAlignmentCenter];
+			[h setFont:[NSFont boldSystemFontOfSize:10]];
+			[v addSubview:h];
+		}
+		y -= 18;
+	}
+
+	#define PREFS_3TOGGLE_NOTIF(LABEL, F1, F2, F3) \
+	do { \
+		CGFloat colW = (W - 180) / 3; \
+		NSTextField *lbl = [NSTextField labelWithString:LABEL]; \
+		[lbl setFrame:NSMakeRect (30, y - 16, 146, 16)]; \
+		[lbl setFont:[NSFont systemFontOfSize:12]]; \
+		[v addSubview:lbl]; \
+		unsigned int *ptrs[3] = { &prefs.F1, &prefs.F2, &prefs.F3 }; \
+		for (int _i = 0; _i < 3; _i++) \
+		{ \
+			NSButton *chk = [[NSButton alloc] \
+				initWithFrame:NSMakeRect ( \
+					180 + _i * colW + colW / 2 - 8, y - 16, 18, 18)]; \
+			[chk setButtonType:NSButtonTypeSwitch]; \
+			[chk setTitle:@""]; \
+			[chk setState:*ptrs[_i] \
+				? NSControlStateValueOn : NSControlStateValueOff]; \
+			[chk setTag:(NSInteger)((char *)ptrs[_i] - (char *)&prefs)]; \
+			[chk setTarget:menuTarget]; \
+			[chk setAction:@selector(prefsBoolToggled:)]; \
+			[v addSubview:chk]; \
+		} \
+		y -= 22; \
+	} while (0)
+
+	PREFS_3TOGGLE_NOTIF (@"Send notification:",
+		hex_input_balloon_chans, hex_input_balloon_priv,
+		hex_input_balloon_hilight);
+
+	#undef PREFS_3TOGGLE_NOTIF
 }
 
 /* --------------------------------------------------------------------------
- *  Tab 6 — Logging
+ *  Tab 6 — Sounds
+ * -------------------------------------------------------------------------- */
+
+extern struct text_event te[];  /* text.c */
+extern char *sound_files[];     /* text.c */
+
+static void
+prefs_build_sounds_tab (NSView *v)
+{
+	CGFloat W = [v bounds].size.width;
+	CGFloat H = [v bounds].size.height;
+
+	/* Two buttons at the bottom. */
+	CGFloat btnY = 8;
+	NSButton *playBtn = [[NSButton alloc]
+		initWithFrame:NSMakeRect (W - 90, btnY, 80, 28)];
+	[playBtn setTitle:@"Play"];
+	[playBtn setBezelStyle:NSBezelStyleRounded];
+	[playBtn setTarget:menuTarget];
+	[playBtn setAction:@selector(soundsPlay:)];
+	[playBtn setAutoresizingMask:(NSViewMinXMargin | NSViewMaxYMargin)];
+	[v addSubview:playBtn];
+
+	NSButton *browseBtn = [[NSButton alloc]
+		initWithFrame:NSMakeRect (W - 180, btnY, 82, 28)];
+	[browseBtn setTitle:@"Browse\xE2\x80\xA6"];
+	[browseBtn setBezelStyle:NSBezelStyleRounded];
+	[browseBtn setTarget:menuTarget];
+	[browseBtn setAction:@selector(soundsBrowse:)];
+	[browseBtn setAutoresizingMask:(NSViewMinXMargin | NSViewMaxYMargin)];
+	[v addSubview:browseBtn];
+
+	/* File path field above buttons. */
+	soundsFileField = [[NSTextField alloc]
+		initWithFrame:NSMakeRect (10, btnY + 34, W - 20, 22)];
+	[soundsFileField setPlaceholderString:@"(no sound file)"];
+	[soundsFileField setFont:[NSFont systemFontOfSize:12]];
+	[soundsFileField setAutoresizingMask:
+		(NSViewWidthSizable | NSViewMaxYMargin)];
+	[v addSubview:soundsFileField];
+
+	/* Table view. */
+	NSScrollView *sv = [[NSScrollView alloc]
+		initWithFrame:NSMakeRect (0, btnY + 62, W, H - (btnY + 62))];
+	[sv setHasVerticalScroller:YES];
+	[sv setHasHorizontalScroller:NO];
+	[sv setBorderType:NSBezelBorder];
+	[sv setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+
+	soundsTable = [[NSTableView alloc]
+		initWithFrame:[[sv contentView] bounds]];
+	[soundsTable setDataSource:(id<NSTableViewDataSource>)menuTarget];
+	[soundsTable setDelegate:(id<NSTableViewDelegate>)menuTarget];
+	[soundsTable setUsesAlternatingRowBackgroundColors:YES];
+
+	NSTableColumn *colEvent = [[NSTableColumn alloc]
+		initWithIdentifier:@"event"];
+	[[colEvent headerCell] setStringValue:@"Event"];
+	[colEvent setWidth:240];
+	[colEvent setEditable:NO];
+	[soundsTable addTableColumn:colEvent];
+
+	NSTableColumn *colFile = [[NSTableColumn alloc]
+		initWithIdentifier:@"file"];
+	[[colFile headerCell] setStringValue:@"Sound File"];
+	[colFile setEditable:YES];
+	[soundsTable addTableColumn:colFile];
+
+	[sv setDocumentView:soundsTable];
+	[v addSubview:sv];
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 7 — Logging
  * -------------------------------------------------------------------------- */
 static void
 prefs_build_logging_tab (NSView *v)
@@ -3656,7 +3835,34 @@ prefs_build_logging_tab (NSView *v)
 }
 
 /* --------------------------------------------------------------------------
- *  Tab 7 — Network
+ *  Tab 8 — Channel Switcher (new)
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_switcher_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Tab Bar");
+	prefs_add_checkbox (v, &y, @"Open server messages in separate tab",
+		&prefs.hex_gui_tab_server);
+	prefs_add_checkbox (v, &y, @"Sort tabs alphabetically",
+		&prefs.hex_gui_tab_sort);
+	prefs_add_checkbox (v, &y, @"Show icons in tab bar",
+		&prefs.hex_gui_tab_icons);
+	prefs_add_checkbox (v, &y, @"Show activity dots on tabs",
+		&prefs.hex_gui_tab_dots);
+	prefs_add_checkbox (v, &y, @"Scroll mouse wheel to change tabs",
+		&prefs.hex_gui_tab_scrollchans);
+	prefs_add_checkbox (v, &y, @"Show channels in tab bar",
+		&prefs.hex_gui_tab_chans);
+	prefs_add_checkbox (v, &y, @"Show dialogs in tab bar",
+		&prefs.hex_gui_tab_dialogs);
+	prefs_add_checkbox (v, &y, @"Show utility tabs",
+		&prefs.hex_gui_tab_utils);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 9 — Network (expanded)
  * -------------------------------------------------------------------------- */
 static void
 prefs_build_network_tab (NSView *v)
@@ -3672,6 +3878,12 @@ prefs_build_network_tab (NSView *v)
 	prefs_add_stepper (v, &y, @"Auto join delay:",
 		&prefs.hex_irc_join_delay, 0, 9999, @"seconds");
 
+	prefs_add_header (v, &y, @"Bind Address");
+	prefsBindHost = prefs_add_textfield (v, &y,
+		@"Outgoing IP / hostname:", prefs.hex_net_bind_host);
+	prefs_add_label (v, &y,
+		@"Leave blank to use default interface.");
+
 	prefs_add_header (v, &y, @"Proxy Server");
 	prefsProxyHost = prefs_add_textfield (v, &y, @"Hostname:",
 		prefs.hex_net_proxy_host);
@@ -3681,6 +3893,9 @@ prefs_build_network_tab (NSView *v)
 		&prefs.hex_net_proxy_type,
 		@[ @"(Disabled)", @"Wingate", @"SOCKS4",
 		   @"SOCKS5", @"HTTP", @"Auto" ]);
+	prefs_add_popup (v, &y, @"Use proxy for:",
+		&prefs.hex_net_proxy_use,
+		@[ @"All connections", @"IRC only", @"DCC only" ]);
 	prefs_add_checkbox (v, &y,
 		@"Use authentication (HTTP or SOCKS5 only)",
 		&prefs.hex_net_proxy_auth);
@@ -3689,16 +3904,67 @@ prefs_build_network_tab (NSView *v)
 	prefsProxyPass = prefs_add_securefield (v, &y, @"Password:",
 		prefs.hex_net_proxy_pass);
 
-	prefs_add_header (v, &y, @"File Transfers");
-	prefs_add_stepper (v, &y, @"First DCC port:",
+	prefs_add_header (v, &y, @"Identd");
+	prefs_add_checkbox (v, &y, @"Enable Identd server",
+		&prefs.hex_identd_server);
+	prefs_add_stepper (v, &y, @"Identd port:",
+		&prefs.hex_identd_port, 1, 65535, nil);
+}
+
+/* --------------------------------------------------------------------------
+ *  Tab 10 — File Transfers (new, split from old Network tab)
+ * -------------------------------------------------------------------------- */
+static void
+prefs_build_filetransfers_tab (NSView *v)
+{
+	CGFloat y = [v bounds].size.height;
+
+	prefs_add_header (v, &y, @"Download");
+	prefs_add_popup (v, &y, @"Auto-accept transfers:",
+		&prefs.hex_dcc_auto_recv,
+		@[ @"Ask", @"Ask to folder", @"Save automatically" ]);
+	prefsDccDir = prefs_add_textfield (v, &y, @"Save files to:",
+		prefs.hex_dcc_dir);
+	prefsDccCompletedDir = prefs_add_textfield (v, &y,
+		@"Move completed to:", prefs.hex_dcc_completed_dir);
+	prefs_add_checkbox (v, &y, @"Include nick in filenames",
+		&prefs.hex_dcc_save_nick);
+
+	prefs_add_header (v, &y, @"Port Range");
+	prefs_add_stepper (v, &y, @"First port:",
 		&prefs.hex_dcc_port_first, 0, 65535, nil);
-	prefs_add_stepper (v, &y, @"Last DCC port:",
+	prefs_add_stepper (v, &y, @"Last port:",
 		&prefs.hex_dcc_port_last, 0, 65535, nil);
-	prefs_add_checkbox (v, &y,
-		@"Get my address from the IRC server",
+
+	prefs_add_header (v, &y, @"IP");
+	prefs_add_checkbox (v, &y, @"Get IP from server",
 		&prefs.hex_dcc_ip_from_server);
 	prefsDccIp = prefs_add_textfield (v, &y, @"DCC IP address:",
 		prefs.hex_dcc_ip);
+
+	prefs_add_header (v, &y, @"Speed Limits");
+	prefs_add_stepper (v, &y, @"Max upload (single):",
+		&prefs.hex_dcc_max_send_cps, 0, 1000000, @"KB/s");
+	prefs_add_stepper (v, &y, @"Max download (single):",
+		&prefs.hex_dcc_max_get_cps, 0, 1000000, @"KB/s");
+	prefs_add_stepper (v, &y, @"Max upload (all):",
+		&prefs.hex_dcc_global_max_send_cps, 0, 1000000, @"KB/s");
+	prefs_add_stepper (v, &y, @"Max download (all):",
+		&prefs.hex_dcc_global_max_get_cps, 0, 1000000, @"KB/s");
+
+	prefs_add_header (v, &y, @"Timeouts");
+	prefs_add_stepper (v, &y, @"Stall timeout:",
+		&prefs.hex_dcc_stall_timeout, 0, 9999, @"seconds");
+	prefs_add_stepper (v, &y, @"DCC timeout:",
+		&prefs.hex_dcc_timeout, 0, 9999, @"seconds");
+
+	prefs_add_header (v, &y, @"Auto-open Windows");
+	prefs_add_checkbox (v, &y, @"Open send window automatically",
+		&prefs.hex_gui_autoopen_send);
+	prefs_add_checkbox (v, &y, @"Open receive window automatically",
+		&prefs.hex_gui_autoopen_recv);
+	prefs_add_checkbox (v, &y, @"Open chat window automatically",
+		&prefs.hex_gui_autoopen_chat);
 }
 
 /* --------------------------------------------------------------------------
@@ -3742,16 +4008,19 @@ show_preferences (void)
 			NSString *ident;
 			void (*builder)(NSView *);
 		} tabs[] = {
-			{ @"Appearance", @"appearance", prefs_build_appearance_tab },
-			{ @"Input",      @"input",      prefs_build_input_tab },
-			{ @"Chatting",   @"chatting",   prefs_build_chatting_tab },
-			{ @"User List",  @"userlist",   prefs_build_userlist_tab },
-			{ @"Alerts",     @"alerts",     prefs_build_alerts_tab },
-			{ @"Logging",    @"logging",    prefs_build_logging_tab },
-			{ @"Network",    @"network",    prefs_build_network_tab },
+			{ @"Appearance",      @"appearance",   prefs_build_appearance_tab },
+			{ @"Input",           @"input",        prefs_build_input_tab },
+			{ @"Chatting",        @"chatting",     prefs_build_chatting_tab },
+			{ @"User List",       @"userlist",     prefs_build_userlist_tab },
+			{ @"Alerts",          @"alerts",       prefs_build_alerts_tab },
+			{ @"Sounds",          @"sounds",       prefs_build_sounds_tab },
+			{ @"Logging",         @"logging",      prefs_build_logging_tab },
+			{ @"Chan Switcher",   @"switcher",     prefs_build_switcher_tab },
+			{ @"Network",         @"network",      prefs_build_network_tab },
+			{ @"File Transfers",  @"filetransfers",prefs_build_filetransfers_tab },
 		};
 
-		for (int i = 0; i < 7; i++)
+		for (int i = 0; i < 10; i++)
 		{
 			NSTabViewItem *item = [[NSTabViewItem alloc]
 				initWithIdentifier:tabs[i].ident];
@@ -3759,7 +4028,7 @@ show_preferences (void)
 
 			/* Each tab gets a flipped-ish coordinate view.
 			   We build top-down manually using y decrements. */
-			NSRect tabRect = [[prefsTabView contentRect] isEqual:NSZeroRect]
+			NSRect tabRect = NSEqualRects ([prefsTabView contentRect], NSZeroRect)
 				? NSMakeRect (0, 0, W - 34, H - 80)
 				: [prefsTabView contentRect];
 			NSView *tabView = [[NSView alloc]
@@ -3829,6 +4098,10 @@ prefs_save_fields (void)
 	SAVE_STR (prefsProxyHost,      prefs.hex_net_proxy_host);
 	SAVE_STR (prefsProxyUser,      prefs.hex_net_proxy_user);
 	SAVE_STR (prefsDccIp,          prefs.hex_dcc_ip);
+	SAVE_STR (prefsBgImage,        prefs.hex_text_background);
+	SAVE_STR (prefsBindHost,       prefs.hex_net_bind_host);
+	SAVE_STR (prefsDccDir,         prefs.hex_dcc_dir);
+	SAVE_STR (prefsDccCompletedDir,prefs.hex_dcc_completed_dir);
 
 	/* Secure field (proxy password). */
 	if (prefsProxyPass)
@@ -3856,6 +4129,7 @@ prefs_save_fields (void)
 {
 	prefs_save_fields ();
 	save_config ();
+	sound_save ();
 	[prefsWindow orderOut:nil];
 	prefsWindow = nil;
 	prefsTabView = nil;
@@ -3868,6 +4142,12 @@ prefs_save_fields (void)
 	prefsProxyHost = prefsProxyUser = nil;
 	prefsProxyPass = nil;
 	prefsDccIp = nil;
+	prefsBgImage = nil;
+	prefsBindHost = nil;
+	prefsDccDir = prefsDccCompletedDir = nil;
+	soundsTable = nil;
+	soundsFileField = nil;
+	soundsSelectedRow = -1;
 }
 
 /*
@@ -3975,6 +4255,98 @@ prefs_save_fields (void)
 	   However, the simplest approach: set ourselves as the font target. */
 	[fm setTarget:menuTarget];
 	[fm setAction:@selector(prefsFontChanged:)];
+}
+
+/*
+ * Sounds tab — NSTableViewDataSource
+ */
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+	if (tableView == soundsTable)
+		return NUM_XP;
+	/* Other tables (edit commands, etc.) handled by their own data source. */
+	return 0;
+}
+
+- (id)tableView:(NSTableView *)tableView
+	objectValueForTableColumn:(NSTableColumn *)tableColumn
+	row:(NSInteger)row
+{
+	if (tableView != soundsTable)
+		return nil;
+	if ([[tableColumn identifier] isEqualToString:@"event"])
+		return [NSString stringWithUTF8String:te[row].name];
+	/* "file" column */
+	if (sound_files[row] && sound_files[row][0])
+		return [NSString stringWithUTF8String:sound_files[row]];
+	return @"";
+}
+
+- (void)tableView:(NSTableView *)tableView
+	setObjectValue:(id)object
+	forTableColumn:(NSTableColumn *)tableColumn
+	row:(NSInteger)row
+{
+	if (tableView != soundsTable)
+		return;
+	if (![[tableColumn identifier] isEqualToString:@"file"])
+		return;
+	const char *str = [object UTF8String];
+	g_free (sound_files[row]);
+	sound_files[row] = (str && str[0]) ? g_strdup (str) : NULL;
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification
+{
+	if ([notification object] != soundsTable)
+		return;
+	soundsSelectedRow = (int)[soundsTable selectedRow];
+	if (soundsSelectedRow >= 0 && soundsSelectedRow < NUM_XP
+		&& soundsFileField)
+	{
+		if (sound_files[soundsSelectedRow] && sound_files[soundsSelectedRow][0])
+			[soundsFileField setStringValue:
+				[NSString stringWithUTF8String:sound_files[soundsSelectedRow]]];
+		else
+			[soundsFileField setStringValue:@""];
+	}
+}
+
+- (void)soundsBrowse:(id)sender
+{
+	if (soundsSelectedRow < 0 || soundsSelectedRow >= NUM_XP)
+		return;
+
+	NSOpenPanel *panel = [NSOpenPanel openPanel];
+	[panel setTitle:@"Choose Sound File"];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	[panel setAllowedFileTypes:@[ @"aiff", @"aif", @"wav", @"mp3",
+		@"m4a", @"caf", @"au" ]];
+	[panel setAllowsOtherFileTypes:YES];
+#pragma clang diagnostic pop
+
+	[panel beginSheetModalForWindow:prefsWindow
+		completionHandler:^(NSModalResponse result) {
+		if (result == NSModalResponseOK)
+		{
+			NSString *path = [[panel URL] path];
+			const char *cpath = [path UTF8String];
+			g_free (sound_files[soundsSelectedRow]);
+			sound_files[soundsSelectedRow] = cpath ? g_strdup (cpath) : NULL;
+			if (soundsFileField)
+				[soundsFileField setStringValue:path ?: @""];
+			[soundsTable reloadData];
+		}
+	}];
+}
+
+- (void)soundsPlay:(id)sender
+{
+	if (soundsSelectedRow < 0 || soundsSelectedRow >= NUM_XP)
+		return;
+	if (sound_files[soundsSelectedRow] && sound_files[soundsSelectedRow][0])
+		sound_play (sound_files[soundsSelectedRow], FALSE);
 }
 
 /*
